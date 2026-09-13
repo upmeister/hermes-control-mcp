@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from hermes_zcode_bridge.api import APIError, APIResponse, HermesAPIClient
-from hermes_zcode_bridge.config import BridgeConfig
+from hermes_zcode_bridge.config import BridgeConfig, ConfigError
 from hermes_zcode_bridge.registry import StateRegistry
 from hermes_zcode_bridge.service import BridgeService
 
@@ -316,6 +316,21 @@ class BridgeContractTests(unittest.TestCase):
         self.assertNotIn("test-api-key", str(caught.exception))
 
 
+class ConfigContractTests(unittest.TestCase):
+    def test_live_access_token_resolves_from_the_server_env_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text('HERMES_DASHBOARD_ACCESS_TOKEN="access-token-value"\n', encoding="utf-8")
+            config = BridgeConfig(api_key="api", env_file=env_file)
+
+            self.assertEqual(config.resolved_gateway_access_token(), "access-token-value")
+            self.assertEqual(config.live_auth_mode(), "access_token")
+
+    def test_gateway_url_rejects_credentials_in_query(self):
+        with self.assertRaises(ConfigError):
+            BridgeConfig(api_key="api", gateway_url="wss://gateway.test/api/ws?token=secret")
+
+
 class MCPContractTests(unittest.TestCase):
     def test_mcp_surface_is_allowlisted(self):
         from hermes_zcode_bridge.mcp_server import create_server
@@ -335,6 +350,12 @@ class MCPContractTests(unittest.TestCase):
         self.assertIn("run_steer", names)
         self.assertIn("session_history", names)
         self.assertIn("bridge_health", names)
+        for name in {
+            "live_session_open", "live_prompt", "live_wait", "live_events",
+            "live_status", "live_history", "live_steer", "live_interrupt",
+            "live_reconcile", "live_reconnect", "live_health",
+        }:
+            self.assertIn(name, names)
         self.assertNotIn("shell_exec", names)
         self.assertNotIn("cli_exec", names)
 

@@ -9,8 +9,23 @@ scope for this repository.
 
 Stage 1 scope: durable API runs (`start`, `status`, `wait`, `events`, `stop`,
 `steer`, `history`, health probes), explicit idempotency/reconciliation, and
-contract tests without LLM calls. Stage 2 live TUI WebSocket is intentionally
-not implemented here yet; A2A/peer interoperability is backlog.
+contract tests without LLM calls. Stage 2 adds a thin live TUI WebSocket client
+and MCP facade; it does not embed Hermes core or replace Desktop/TUI. A2A/peer
+interoperability remains backlog.
+
+Stage 2 live surface:
+
+- `live_session_open` connects and creates/resumes a durable session;
+- `live_prompt` submits one prompt; `live_wait` waits for its start/complete pair;
+- `live_events` reads the bounded event buffer; `live_status`/`live_history` are
+  recovery reads; `live_steer`/`live_interrupt` are exact-session controls;
+- `live_reconnect` explicitly reconnects and replays retained per-session events;
+- `live_health` reports connection/auth/replay state without submitting a prompt.
+
+The live client uses the existing TUI `/api/ws` protocol. Gated dashboards require
+an operator-provided access token that mints a fresh one-use WS ticket; it never
+bypasses dashboard auth or reads browser cookies. Loopback legacy token auth is
+supported for local/SSH setups only.
 
 ## Source of truth and deployment
 
@@ -53,14 +68,17 @@ python3 -m compileall -q src
 python3 -m py_compile src/hermes_zcode_bridge/*.py
 ```
 
-The test suite is stdlib `unittest` and uses fake transports only. A live
-health/models/capabilities probe is a separate non-consuming smoke; an LLM turn
-is deliberately deferred by the project owner until the bridge is more mature.
+The test suite is stdlib `unittest` with deterministic fake transports; a
+separate non-consuming loopback smoke uses the real `websockets` client/server
+handshake and replay path. A live health/models/capabilities probe is also
+non-consuming; an LLM turn is deliberately deferred by the project owner until
+the bridge is more mature.
 
 ## Style and changes
 
-Use Python 3.11+ with stdlib-first code and a bounded `mcp` dependency only for
-MCP protocol serving. Keep modules focused; use TDD RED → GREEN → REFACTOR.
+Use Python 3.11+ with stdlib-first code and bounded `mcp`, `httpx`, and
+`websockets` dependencies only for protocol serving/client transport. Keep
+modules focused; use TDD RED → GREEN → REFACTOR.
 Do not add a new daemon, queue, broker, database service, or UI. Behavioral
 configuration belongs in a tracked config/CLI argument; secrets belong in the
 server `.env`. Public publication, package release, and production deploy need
