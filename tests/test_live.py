@@ -232,6 +232,90 @@ class LiveClientTests(unittest.TestCase):
         self.assertNotIn("subprotocols", gateway.connect_kwargs[0])
         self.assertNotIn("subprotocols", gateway.connect_kwargs[1])
 
+    def test_expired_access_token_refreshes_once_before_minting_ticket(self):
+        ticket_authorizations: list[str] = []
+        refresh_bodies: list[dict] = []
+
+        class RefreshHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length)
+                if self.path == "/prefix/api/auth/ws-ticket":
+                    ticket_authorizations.append(self.headers.get("Authorization", ""))
+                    if len(ticket_authorizations) == 1:
+                        self.send_response(401)
+                        self.end_headers()
+                        return
+                    payload = {"ticket": "ticket-after-refresh"}
+                elif self.path == "/prefix/auth/native/refresh":
+                    refresh_bodies.append(json.loads(body))
+                    payload = {
+                        "access_token": "access-after-refresh",
+                        "refresh_token": "refresh-after-refresh",
+                        "provider": "stub",
+                    }
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                encoded = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, format, *args):
+                return
+
+        ticket_server = ThreadingHTTPServer(("127.0.0.1", 0), RefreshHandler)
+        ticket_thread = threading.Thread(target=ticket_server.serve_forever, daemon=True)
+        ticket_thread.start()
+        self.addCleanup(ticket_server.server_close)
+        self.addCleanup(ticket_server.shutdown)
+        self.addCleanup(ticket_thread.join, 2.0)
+
+        gateway = FakeGateway()
+        config, _ = self.make_config(
+            gateway,
+            gateway_token="",
+            gateway_access_token="expired-access",
+            gateway_refresh_token="refresh-before",
+            gateway_auth_provider="stub",
+            gateway_url=f"ws://127.0.0.1:{ticket_server.server_port}/prefix/api/ws",
+        )
+        client = LiveGatewayClient(config, connector=gateway.connect)
+        self.addCleanup(client.shutdown)
+
+        client.connect()
+
+        self.assertEqual(ticket_authorizations, [
+            "Bearer expired-access", "Bearer access-after-refresh",
+        ])
+        self.assertEqual(refresh_bodies, [{
+            "refresh_token": "refresh-before", "provider": "stub",
+        }])
+        self.assertEqual(parse_qs(urlsplit(gateway.connect_urls[0]).query)["ticket"], ["ticket-after-refresh"])
+
+        gateway2 = FakeGateway()
+        config2, _ = self.make_config(
+            gateway2,
+            gateway_token="",
+            gateway_access_token="",
+            gateway_refresh_token="refresh-only",
+            gateway_auth_provider="stub",
+            gateway_url=f"ws://127.0.0.1:{ticket_server.server_port}/prefix/api/ws",
+        )
+        client2 = LiveGatewayClient(config2, connector=gateway2.connect)
+        self.addCleanup(client2.shutdown)
+        client2.connect()
+
+        self.assertEqual(ticket_authorizations[-1], "Bearer access-after-refresh")
+        self.assertEqual(refresh_bodies[-1], {
+            "refresh_token": "refresh-only", "provider": "stub",
+        })
+        self.assertEqual(parse_qs(urlsplit(gateway2.connect_urls[0]).query)["ticket"], ["ticket-after-refresh"])
+
     def test_reconnect_replays_gap_before_racing_live_event(self):
         gateway = FakeGateway()
         config, _ = self.make_config(gateway)
@@ -291,7 +375,7 @@ class LiveClientTests(unittest.TestCase):
             socket.push({"jsonrpc": "2.0", "method": "event", "params": {
                 "type": "message.delta", "session_id": "runtime-1", "seq": seq,
             }})
-        self.wait_until(lambda: len(client.events("runtime-1")) == 2)
+        self.wait_until(lambda: [e["seq"] for e in client.events("runtime-1")] == [2, 3])
         self.assertEqual([e["seq"] for e in client.events("runtime-1")], [2, 3])
         self.assertTrue(client.events_truncated("runtime-1", after_seq=0))
         self.assertFalse(client.events_truncated("runtime-1", after_seq=2))

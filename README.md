@@ -173,9 +173,10 @@ python3 -m compileall -q src
 MCP initialize/tools/list/tools/call, explicit session/provider, lane binding,
 request fingerprint, same-key reconciliation after timeout, exact stop/steer,
 wait, SSE parsing, history, error redaction, persistent TUI WS, event replay,
-seq-gap race, ticket rotation и отсутствие secret в stderr. Настоящий
+seq-gap race, ticket/refresh rotation и отсутствие secret в stderr. Настоящий
 loopback `websockets 15.0.1` smoke также прошёл с двумя WS generations и
-replay seq `[1, 2, 3, 4]`; LLM-turn smoke намеренно не запускался.
+replay seq `[1, 2, 3, 4]`; three strict repetitions and the 30-test suite are
+green; LLM-turn smoke намеренно не запускался.
 
 ## API Server activation
 
@@ -213,10 +214,15 @@ loopback credential и **не** подходит для gated `/api/ws`; bridge 
 
 1. `HERMES_DASHBOARD_ACCESS_TOKEN` — dashboard access token; bridge отправляет
    его на существующий `POST /api/auth/ws-ticket` и получает новый одноразовый
-   ticket на каждый WS connect/reconnect;
-2. `--gateway-ticket-env` — заранее выданный single-use ticket для одной
+   ticket на каждый WS connect/reconnect. При `401/403` bridge может один раз
+   вызвать `/auth/native/refresh`, если настроен `HERMES_DASHBOARD_REFRESH_TOKEN`,
+   и повторить mint с новым access token;
+2. `HERMES_DASHBOARD_REFRESH_TOKEN` — optional native refresh token; rotated
+   access/refresh values держатся только в памяти текущего bridge и не пишутся
+   обратно в `.env`, поэтому после рестарта нужен действующий env refresh token;
+3. `--gateway-ticket-env` — заранее выданный single-use ticket для одной
    сессии (после disconnect требуется новый ticket);
-3. legacy `HERMES_DASHBOARD_SESSION_TOKEN` — только для loopback dashboard,
+4. legacy `HERMES_DASHBOARD_SESSION_TOKEN` — только для loopback dashboard,
    где auth gate выключен.
 
 `API_SERVER_KEY` относится только к `:8642` и не является заменой dashboard
@@ -226,13 +232,12 @@ access token. Если live credential не настроен или отверг
 ## Границы Stage 1
 
 API run process и Hermes Desktop `hermes serve` — разные runtime/transport
-процессы. Stage 1 даёт durable job lane, status, recovery и control, но не
-обещает, что ZCode увидит live token stream Desktop. Shared live session,
-attach/reconnect/replay и совместная очередь prompt — Stage 2 через TUI
-WebSocket. Stage 2 не создаёт новый agent runtime: он подключается вторым
-authenticated client к существующему `/api/ws`, поэтому Desktop и ZCode могут
-быть attached к одной session. A2A, peer/Bot Chat и public package release
-пока backlog.
+процессы. Stage 1 даёт durable job lane, status, recovery и control. Stage 2
+уже реализует shared live session, attach/reconnect/replay и совместную
+очередь prompt через TUI WebSocket; он не создаёт новый agent runtime, а
+подключается вторым authenticated client к существующему `/api/ws`. Production
+concurrency/LLM gate ждёт operator auth credential. A2A, peer/Bot Chat и public
+package release пока backlog.
 
 Issue `#94017` про повторный provider resolution persisted session остаётся
 отдельным Hermes risk. Перед использованием named `custom:*` provider нужно

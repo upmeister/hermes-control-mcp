@@ -23,9 +23,10 @@ Stage 2 live surface:
 - `live_health` reports connection/auth/replay state without submitting a prompt.
 
 The live client uses the existing TUI `/api/ws` protocol. Gated dashboards require
-an operator-provided access token that mints a fresh one-use WS ticket; it never
-bypasses dashboard auth or reads browser cookies. Loopback legacy token auth is
-supported for local/SSH setups only.
+an operator-provided access token (optionally paired with a native refresh token)
+that mints a fresh one-use WS ticket; rotated credentials remain process-memory
+only. It never bypasses dashboard auth or reads browser cookies. Loopback legacy
+token auth is supported for local/SSH setups only.
 
 ## Source of truth and deployment
 

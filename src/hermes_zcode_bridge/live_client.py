@@ -100,6 +100,8 @@ class LiveGatewayClient:
         }
         self._last_connect_url = ""
         self._ticket_consumed = False
+        self._runtime_access_token: str | None = None
+        self._runtime_refresh_token: str | None = None
         self._last_inbound = 0.0
         self._heartbeat_task: asyncio.Task | None = None
 
@@ -643,11 +645,11 @@ class LiveGatewayClient:
     def _connect_parameters(self) -> str:
         if not self.config.gateway_url:
             raise LiveError("gateway_url is not configured", code="gateway_not_configured")
-        access_token = self.config.resolved_gateway_access_token()
+        access_token = self._runtime_access_token or self.config.resolved_gateway_access_token()
         ticket = self.config.resolved_gateway_ticket()
         token = self.config.resolved_gateway_token()
-        if access_token:
-            fresh_ticket = self._mint_ticket(access_token)
+        if access_token or self.config.resolved_gateway_refresh_token():
+            fresh_ticket = self._mint_ticket(access_token or "")
             return self._with_auth_query(self.config.gateway_url, "ticket", fresh_ticket)
         if ticket:
             if self._ticket_consumed:
@@ -671,21 +673,32 @@ class LiveGatewayClient:
         return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
     def _mint_ticket(self, access_token: str) -> str:
-        base = self.config.gateway_http_url
-        if not base:
-            parts = urlsplit(self.config.gateway_url or "")
-            scheme = "https" if parts.scheme == "wss" else "http"
-            path = parts.path
-            suffix = "/api/ws"
-            if path.endswith(suffix):
-                path = path[:-len(suffix)]
-            base = urlunsplit((scheme, parts.netloc, path.rstrip("/"), "", ""))
-        url = base.rstrip("/") + "/api/auth/ws-ticket"
+        base = self._gateway_http_base()
+        ticket_url = base.rstrip("/") + "/api/auth/ws-ticket"
+        refresh_url = base.rstrip("/") + "/auth/native/refresh"
+        refresh_token = self._runtime_refresh_token or self.config.resolved_gateway_refresh_token()
         try:
             import httpx
             with httpx.Client(trust_env=False, follow_redirects=False, timeout=self.config.gateway_connect_timeout) as client:
-                response = client.post(url, headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"})
+                if not access_token:
+                    if not refresh_token or not self._refresh_access_token(client, refresh_url, refresh_token):
+                        raise LiveAuthError("live gateway access token is missing and refresh failed")
+                    access_token = self._runtime_access_token or ""
+                response = client.post(
+                    ticket_url,
+                    headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+                )
+                if response.status_code in {401, 403} and refresh_token:
+                    if not self._refresh_access_token(client, refresh_url, refresh_token):
+                        raise LiveAuthError("live gateway access token and refresh token were rejected")
+                    access_token = self._runtime_access_token or ""
+                    response = client.post(
+                        ticket_url,
+                        headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+                    )
         except Exception as exc:  # noqa: BLE001 - do not surface credential-bearing URL/library text
+            if isinstance(exc, LiveAuthError):
+                raise
             raise LiveAuthError("live gateway WS ticket request failed") from exc
         if response.status_code < 200 or response.status_code >= 300:
             raise LiveAuthError(f"live gateway WS ticket request rejected (HTTP {response.status_code})")
@@ -697,3 +710,38 @@ class LiveGatewayClient:
         if not isinstance(value, str) or not value or len(value) > 512:
             raise LiveAuthError("live gateway WS ticket response did not contain a valid ticket")
         return value
+
+    def _gateway_http_base(self) -> str:
+        base = self.config.gateway_http_url
+        if base:
+            return base
+        parts = urlsplit(self.config.gateway_url or "")
+        scheme = "https" if parts.scheme == "wss" else "http"
+        path = parts.path
+        suffix = "/api/ws"
+        if path.endswith(suffix):
+            path = path[:-len(suffix)]
+        return urlunsplit((scheme, parts.netloc, path.rstrip("/"), "", ""))
+
+    def _refresh_access_token(self, client: Any, url: str, refresh_token: str) -> bool:
+        body: dict[str, str] = {"refresh_token": refresh_token}
+        provider = self.config.gateway_auth_provider.strip()
+        if provider:
+            body["provider"] = provider
+        try:
+            response = client.post(url, json=body, headers={"Accept": "application/json"})
+            if response.status_code < 200 or response.status_code >= 300:
+                return False
+            payload = response.json()
+        except Exception:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        access_token = payload.get("access_token")
+        new_refresh_token = payload.get("refresh_token")
+        if not isinstance(access_token, str) or not access_token:
+            return False
+        self._runtime_access_token = access_token
+        if isinstance(new_refresh_token, str) and new_refresh_token:
+            self._runtime_refresh_token = new_refresh_token
+        return True
