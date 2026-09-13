@@ -11,6 +11,7 @@ DEFAULT_API_URL = "http://127.0.0.1:8642"
 DEFAULT_API_KEY_ENV = "API_SERVER_KEY"
 DEFAULT_GATEWAY_TOKEN_ENV = "HERMES_DASHBOARD_SESSION_TOKEN"
 DEFAULT_GATEWAY_ACCESS_TOKEN_ENV = "HERMES_DASHBOARD_ACCESS_TOKEN"
+DEFAULT_GATEWAY_REFRESH_TOKEN_ENV = "HERMES_DASHBOARD_REFRESH_TOKEN"
 
 
 class ConfigError(ValueError):
@@ -115,6 +116,9 @@ class BridgeConfig:
     gateway_token_env: str = DEFAULT_GATEWAY_TOKEN_ENV
     gateway_access_token: str | None = field(default=None, repr=False)
     gateway_access_token_env: str = DEFAULT_GATEWAY_ACCESS_TOKEN_ENV
+    gateway_refresh_token: str | None = field(default=None, repr=False)
+    gateway_refresh_token_env: str = DEFAULT_GATEWAY_REFRESH_TOKEN_ENV
+    gateway_auth_provider: str = ""
     gateway_ticket: str | None = field(default=None, repr=False)
     gateway_ticket_env: str = ""
     gateway_connect_timeout: float = 15.0
@@ -164,9 +168,16 @@ class BridgeConfig:
     def resolved_gateway_ticket(self) -> str | None:
         return _resolve_secret(self.gateway_ticket, self.gateway_ticket_env, self.env_file or (hermes_home() / ".env"))
 
+    def resolved_gateway_refresh_token(self) -> str | None:
+        return _resolve_secret(self.gateway_refresh_token, self.gateway_refresh_token_env, self.env_file or (hermes_home() / ".env"))
+
     def live_auth_mode(self) -> str:
+        if self.resolved_gateway_access_token() and self.resolved_gateway_refresh_token():
+            return "access_token_refresh"
         if self.resolved_gateway_access_token():
             return "access_token"
+        if self.resolved_gateway_refresh_token():
+            return "refresh_token"
         if self.resolved_gateway_ticket():
             return "ticket"
         if self.resolved_gateway_token():

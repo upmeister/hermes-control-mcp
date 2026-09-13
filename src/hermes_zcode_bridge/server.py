@@ -11,6 +11,7 @@ from .config import (
     DEFAULT_API_KEY_ENV,
     DEFAULT_API_URL,
     DEFAULT_GATEWAY_ACCESS_TOKEN_ENV,
+    DEFAULT_GATEWAY_REFRESH_TOKEN_ENV,
     DEFAULT_GATEWAY_TOKEN_ENV,
     BridgeConfig,
     ConfigError,
@@ -41,6 +42,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gateway-access-token-env", default=DEFAULT_GATEWAY_ACCESS_TOKEN_ENV,
         help="Env name for a dashboard access token used to mint fresh WS tickets",
+    )
+    parser.add_argument(
+        "--gateway-refresh-token-env", default=DEFAULT_GATEWAY_REFRESH_TOKEN_ENV,
+        help="Env name for an optional native refresh token (rotated only in process memory)",
+    )
+    parser.add_argument(
+        "--gateway-auth-provider", default="",
+        help="Optional dashboard auth provider name for native refresh",
     )
     parser.add_argument(
         "--gateway-ticket-env", default="",
@@ -74,6 +83,8 @@ def main(argv: list[str] | None = None) -> int:
             gateway_http_url=args.gateway_http_url,
             gateway_token_env=args.gateway_token_env,
             gateway_access_token_env=args.gateway_access_token_env,
+            gateway_refresh_token_env=args.gateway_refresh_token_env,
+            gateway_auth_provider=args.gateway_auth_provider,
             gateway_ticket_env=args.gateway_ticket_env,
             gateway_connect_timeout=args.gateway_connect_timeout,
             gateway_request_timeout=args.gateway_request_timeout,
