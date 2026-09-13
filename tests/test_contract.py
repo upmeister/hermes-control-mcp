@@ -248,9 +248,10 @@ class BridgeContractTests(unittest.TestCase):
     def test_client_reads_key_from_server_env_file_without_exposing_it_to_request_id(self):
         with tempfile.TemporaryDirectory() as tmp:
             env_file = Path(tmp) / ".env"
-            env_file.write_text('API_SERVER_KEY="file-secret"\n', encoding="utf-8")
+            env_file.write_text('TEST_FILE_KEY="file-secret"\n', encoding="utf-8")
             config = BridgeConfig(
-                api_url="http://bridge.test", env_file=env_file, state_db=Path(tmp) / "state.db"
+                api_url="http://bridge.test", env_file=env_file, api_key_env="TEST_FILE_KEY",
+                state_db=Path(tmp) / "state.db"
             )
             captured = {}
 

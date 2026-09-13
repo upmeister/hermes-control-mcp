@@ -4,7 +4,6 @@ import json
 import os
 import selectors
 import subprocess
-import sys
 import tempfile
 import threading
 import unittest
@@ -49,9 +48,7 @@ class StdioEntrypointTests(unittest.TestCase):
             env["TEST_BRIDGE_KEY"] = "test-api-key"
             process = subprocess.Popen(
                 [
-                    sys.executable,
-                    "-m",
-                    "hermes_zcode_bridge.server",
+                    str(Path(__file__).parents[1] / "scripts" / "run-bridge.sh"),
                     "--api-url",
                     f"http://127.0.0.1:{api.server_port}",
                     "--api-key-env",
