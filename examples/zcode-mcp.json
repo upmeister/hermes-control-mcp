@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "hermes_bridge": {
+      "command": "ssh",
+      "args": [
+        "peetna-aws",
+        "/home/ubuntu/projects/hermes-zcode-bridge/scripts/run-bridge.sh"
+      ],
+      "timeout": 180,
+      "connect_timeout": 30
+    }
+  }
+}
