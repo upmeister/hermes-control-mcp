@@ -132,7 +132,11 @@ LLM-turn smoke намеренно deferred владельцем проекта.
 
 ## API Server activation
 
-Перед live probe нужно включить API Server в server-side Hermes `.env`:
+На текущем сервере Stage 1 activation уже применена и проверена: API Server
+слушает только `127.0.0.1:8642`, gateway active, authenticated health/models/
+capabilities probes проходят. Для другой установки применяй конфигурацию ниже.
+
+Перед включением нужно добавить в server-side Hermes `.env`:
 
 ```text
 API_SERVER_ENABLED=true
