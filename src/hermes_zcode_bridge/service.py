@@ -64,6 +64,9 @@ class BridgeService:
     def __init__(self, client: HermesAPIClient, registry: StateRegistry):
         self.client = client
         self.registry = registry
+        from .live_client import LiveGatewayClient
+        from .live_service import LiveService
+        self.live = LiveService(LiveGatewayClient(client.config), registry)
 
     @staticmethod
     def _result(
@@ -417,3 +420,41 @@ class BridgeService:
         return self._result(
             status="healthy", health=health, models=models, capabilities=capabilities
         )
+
+    # The live surface is kept in live_service.py so the durable-runs facade
+    # does not become a second protocol implementation.
+    def live_session_open(self, **kwargs: Any) -> dict[str, Any]:
+        return self.live.open(**kwargs)
+
+    def live_prompt(self, **kwargs: Any) -> dict[str, Any]:
+        return self.live.prompt(**kwargs)
+
+    def live_wait(self, **kwargs: Any) -> dict[str, Any]:
+        return self.live.wait(**kwargs)
+
+    def live_events(self, **kwargs: Any) -> dict[str, Any]:
+        return self.live.events(**kwargs)
+
+    def live_status(self, **kwargs: Any) -> dict[str, Any]:
+        return self.live.status(**kwargs)
+
+    def live_history(self, **kwargs: Any) -> dict[str, Any]:
+        return self.live.history(**kwargs)
+
+    def live_steer(self, **kwargs: Any) -> dict[str, Any]:
+        return self.live.steer(**kwargs)
+
+    def live_interrupt(self, **kwargs: Any) -> dict[str, Any]:
+        return self.live.interrupt(**kwargs)
+
+    def live_reconcile(self, **kwargs: Any) -> dict[str, Any]:
+        return self.live.reconcile(**kwargs)
+
+    def live_reconnect(self) -> dict[str, Any]:
+        return self.live.reconnect()
+
+    def live_health(self) -> dict[str, Any]:
+        return self.live.health()
+
+    def close(self) -> None:
+        self.live.shutdown()

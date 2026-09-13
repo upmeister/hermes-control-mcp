@@ -88,6 +88,10 @@ class StdioEntrypointTests(unittest.TestCase):
             self.assertIn("run_start", names)
             self.assertIn("run_wait", names)
             self.assertIn("bridge_health", names)
+            self.assertIn("live_session_open", names)
+            self.assertIn("live_prompt", names)
+            self.assertIn("live_reconnect", names)
+            self.assertIn("live_health", names)
             self.assertNotIn("shell_exec", names)
 
             self._send(process, {
@@ -103,6 +107,16 @@ class StdioEntrypointTests(unittest.TestCase):
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["status"], "healthy")
             self.assertEqual(payload["models"]["data"][0]["id"], "hermes-agent")
+            self._send(process, {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": "live_health", "arguments": {}},
+            })
+            live_called = self._read_response(process)
+            live_payload = json.loads(live_called["result"]["content"][0]["text"])
+            self.assertEqual(live_payload["status"], "unconfigured")
+            self.assertEqual(live_payload["error_code"], "gateway_not_configured")
             process.stdin.close()
             process.wait(timeout=5)
             stderr = process.stderr.read() if process.stderr else ""

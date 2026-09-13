@@ -20,6 +20,17 @@ _TOOL_DESCRIPTIONS = {
     "run_steer": "Queue course correction for one exact running Hermes run.",
     "session_history": "Read bounded durable message history for one exact Hermes session.",
     "bridge_health": "Run non-consuming Hermes health, models, and capabilities probes.",
+    "live_session_open": "Connect to the existing Hermes TUI WebSocket and create or resume one durable session lane.",
+    "live_prompt": "Submit one prompt to a live TUI session; never retries an unknown acknowledgement.",
+    "live_wait": "Wait for a live prompt's message.start/message.complete pair with a bounded timeout.",
+    "live_events": "Read bounded live TUI events after an optional per-session sequence cursor.",
+    "live_status": "Read exact live TUI session status without submitting a prompt.",
+    "live_history": "Read exact live TUI session history for recovery/reconciliation.",
+    "live_steer": "Queue exact-session live TUI steering text.",
+    "live_interrupt": "Interrupt the exact live TUI session turn cooperatively.",
+    "live_reconcile": "Reconcile an unknown live prompt against durable history without resubmitting it.",
+    "live_reconnect": "Reconnect the live TUI WebSocket and replay retained per-session events.",
+    "live_health": "Report live TUI connection, auth-mode, bounded-buffer, and replay state without an LLM turn.",
 }
 
 
@@ -34,9 +45,10 @@ def create_server(service: BridgeService):
     server = MCPServer(
         "hermes-zcode-bridge",
         instructions=(
-            "Thin Hermes Agent durable-runs bridge. Use exact lane/session/run/request identities. "
-            "Unknown transport outcomes require explicit reconciliation; this server does not expose shell, "
-            "CLI, configuration mutation, slash commands, or raw gateway RPC."
+            "Thin Hermes Agent durable-runs and live-TUI bridge. Use exact lane/session/run/request identities. "
+            "Unknown transport outcomes require explicit reconciliation; live prompts are never silently retried. "
+            "The live TUI surface uses the existing /api/ws protocol and does not expose shell, CLI, configuration "
+            "mutation, raw gateway dispatch, or slash commands."
         ),
     )
 
@@ -95,6 +107,77 @@ def create_server(service: BridgeService):
         """Probe health/models/capabilities without submitting an LLM turn."""
         return _json_result(service.health())
 
+    def live_session_open(
+        lane: str,
+        session_id: str = "",
+        title: str = "",
+        cwd: str = "",
+        profile: str = "",
+        model: str = "",
+        provider: str = "",
+        close_on_disconnect: bool = False,
+    ) -> str:
+        """Open a persistent live lane; session_id is the durable id to resume, when supplied."""
+        return _json_result(service.live_session_open(
+            lane=lane, session_id=session_id or None, title=title or None, cwd=cwd or None,
+            profile=profile or None, model=model or None, provider=provider or None,
+            close_on_disconnect=close_on_disconnect,
+        ))
+
+    def live_prompt(
+        lane: str,
+        text: str,
+        session_id: str = "",
+        request_id: str = "",
+        queued: bool = False,
+        wait_seconds: float = 0.0,
+    ) -> str:
+        """Submit one live prompt; wait_seconds optionally collects its final event."""
+        return _json_result(service.live_prompt(
+            lane=lane, text=text, session_id=session_id or None,
+            request_id=request_id or None, queued=queued, wait_seconds=wait_seconds,
+        ))
+
+    def live_wait(request_id: str = "", lane: str = "", timeout_seconds: float = 120.0) -> str:
+        """Wait for the exact request or latest prompt in a lane."""
+        return _json_result(service.live_wait(
+            request_id=request_id or None, lane=lane or None, timeout_seconds=timeout_seconds,
+        ))
+
+    def live_events(lane: str = "", session_id: str = "", after_seq: int = 0) -> str:
+        """Read buffered live events without asking the backend to replay them."""
+        return _json_result(service.live_events(
+            lane=lane or None, session_id=session_id or None, after_seq=after_seq,
+        ))
+
+    def live_status(lane: str = "", session_id: str = "") -> str:
+        """Read exact live session status."""
+        return _json_result(service.live_status(lane=lane or None, session_id=session_id or None))
+
+    def live_history(lane: str = "", session_id: str = "") -> str:
+        """Read exact live session history."""
+        return _json_result(service.live_history(lane=lane or None, session_id=session_id or None))
+
+    def live_steer(text: str, lane: str = "", session_id: str = "") -> str:
+        """Queue text into the exact live session."""
+        return _json_result(service.live_steer(text=text, lane=lane or None, session_id=session_id or None))
+
+    def live_interrupt(lane: str = "", session_id: str = "") -> str:
+        """Interrupt the exact live session."""
+        return _json_result(service.live_interrupt(lane=lane or None, session_id=session_id or None))
+
+    def live_reconcile(request_id: str) -> str:
+        """Reconcile unknown live prompt state from durable history, never by resubmitting."""
+        return _json_result(service.live_reconcile(request_id=request_id))
+
+    def live_reconnect() -> str:
+        """Reconnect the live socket and perform bounded event replay."""
+        return _json_result(service.live_reconnect())
+
+    def live_health() -> str:
+        """Report live transport state without submitting a turn."""
+        return _json_result(service.live_health())
+
     for name, fn in (
         ("run_start", run_start),
         ("run_status", run_status),
@@ -104,6 +187,17 @@ def create_server(service: BridgeService):
         ("run_steer", run_steer),
         ("session_history", session_history),
         ("bridge_health", bridge_health),
+        ("live_session_open", live_session_open),
+        ("live_prompt", live_prompt),
+        ("live_wait", live_wait),
+        ("live_events", live_events),
+        ("live_status", live_status),
+        ("live_history", live_history),
+        ("live_steer", live_steer),
+        ("live_interrupt", live_interrupt),
+        ("live_reconcile", live_reconcile),
+        ("live_reconnect", live_reconnect),
+        ("live_health", live_health),
     ):
         register(name, fn, _TOOL_DESCRIPTIONS[name])
     return server

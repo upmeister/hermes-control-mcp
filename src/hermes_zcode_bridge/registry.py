@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-import os
 import sqlite3
 import threading
 import time
@@ -56,6 +54,20 @@ class StateRegistry:
             );
             CREATE INDEX IF NOT EXISTS requests_by_lane ON requests(lane, updated_at DESC);
             CREATE INDEX IF NOT EXISTS requests_by_run ON requests(run_id);
+            CREATE TABLE IF NOT EXISTS live_requests (
+                request_id TEXT PRIMARY KEY,
+                lane TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                prompt_sha256 TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                status TEXT NOT NULL,
+                runtime_session_id TEXT,
+                start_seq INTEGER,
+                error_code TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS live_requests_by_lane ON live_requests(lane, updated_at DESC);
             """
         )
         self._conn.commit()
@@ -158,6 +170,73 @@ class StateRegistry:
                 "SELECT * FROM requests WHERE lane=? ORDER BY updated_at DESC LIMIT 1", (lane,)
             ).fetchone()
         return self._as_dict(row)
+
+    # ----- live request state --------------------------------------------
+
+    def save_live_request(
+        self,
+        *,
+        request_id: str,
+        lane: str,
+        session_id: str,
+        prompt_sha256: str,
+        fingerprint: str,
+        status: str,
+        runtime_session_id: str | None = None,
+        start_seq: int | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO live_requests(
+                       request_id, lane, session_id, prompt_sha256, fingerprint,
+                       status, runtime_session_id, start_seq, error_code,
+                       created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(request_id) DO UPDATE SET
+                       lane=excluded.lane, session_id=excluded.session_id,
+                       prompt_sha256=excluded.prompt_sha256, fingerprint=excluded.fingerprint,
+                       status=excluded.status, runtime_session_id=excluded.runtime_session_id,
+                       start_seq=excluded.start_seq, error_code=excluded.error_code,
+                       updated_at=excluded.updated_at""",
+                (request_id, lane, session_id, prompt_sha256, fingerprint, status,
+                 runtime_session_id, start_seq, error_code, now, now),
+            )
+            self._conn.commit()
+            self._tighten_permissions()
+
+    def update_live_request(self, request_id: str, **fields: Any) -> None:
+        allowed = {"status", "runtime_session_id", "start_seq", "error_code", "session_id", "lane"}
+        changes = {key: value for key, value in fields.items() if key in allowed}
+        if not changes:
+            return
+        changes["updated_at"] = time.time()
+        assignments = ", ".join(f"{key}=?" for key in changes)
+        values = [changes[key] for key in changes] + [request_id]
+        with self._lock:
+            self._conn.execute(f"UPDATE live_requests SET {assignments} WHERE request_id=?", values)
+            self._conn.commit()
+            self._tighten_permissions()
+
+    def live_request_by_id(self, request_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM live_requests WHERE request_id=?", (request_id,)).fetchone()
+        return self._as_dict(row)
+
+    def latest_live_request_for_lane(self, lane: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM live_requests WHERE lane=? ORDER BY updated_at DESC LIMIT 1", (lane,)
+            ).fetchone()
+        return self._as_dict(row)
+
+    def live_requests_for_lane(self, lane: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM live_requests WHERE lane=? ORDER BY updated_at DESC", (lane,)
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def close(self) -> None:
         with self._lock:

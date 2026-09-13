@@ -1,11 +1,11 @@
 # hermes-zcode-bridge
 
-Тонкий MCP stdio bridge для ZCode → Hermes Agent API Server. Он не добавляет
-новый UI и не меняет Hermes core: ZCode запускает один долгоживущий MCP
-процесс, bridge вызывает authenticated `/v1/runs`, а Hermes сам сохраняет
-session/run state.
+Тонкий MCP stdio bridge для ZCode → Hermes Agent API Server и live TUI gateway.
+Он не добавляет новый UI и не меняет Hermes core: ZCode запускает один
+долгоживущий MCP процесс, bridge вызывает authenticated `/v1/runs` или один
+долгоживущий `/api/ws`, а Hermes сам сохраняет session/run state.
 
-## Что решает Stage 1
+## Что решает Stage 1 и Stage 2
 
 Текущий SSH+`hermes chat --oneshot` создаёт новый CLI/runtime path на каждый
 prompt. Здесь процессная схема другая:
@@ -22,6 +22,19 @@ ssh peetna-aws → scripts/run-bridge.sh → hermes-zcode-bridge
                                       ▼
                        durable run + Hermes session history
 ```
+
+Stage 2 добавляет отдельный живой leg, не меняя этот Stage1 fallback:
+
+```text
+ZCode MCP stdio ──SSH──> bridge ──persistent WS──> hermes serve /api/ws :9119
+                                                   │
+                                                   ├─ Hermes Desktop
+                                                   └─ dashboard/TUI clients
+```
+
+Оба клиента остаются attached к одному Hermes runtime. `session.resume` не
+забирает live lease: текущий Hermes `tui_gateway` fan-out'ит events всем
+аутентифицированным attachments.
 
 Bridge хранит в локальной SQLite только:
 
@@ -46,6 +59,20 @@ MCP host увидит следующие tools (обычно с префиксо
 - `run_steer` — course correction exact running run;
 - `session_history` — bounded oldest-first history exact session;
 - `bridge_health` — `/health`, `/v1/models`, `/v1/capabilities`, без LLM turn.
+
+Stage 2 live tools:
+
+- `live_session_open` — открыть или resume одну lane через `/api/ws`; результат
+  содержит `session_id` (runtime identity) и `stored_session_id` (durable identity);
+- `live_prompt` — отправить prompt в существующий TUI session; переносы строк и
+  tab сохраняются буквально; `wait_seconds` опционально ждёт terminal event;
+- `live_wait` — дождаться пары `message.start` → `message.complete`;
+- `live_events` — прочитать bounded in-memory event buffer после `after_seq`;
+- `live_status` / `live_history` — recovery reads;
+- `live_steer` / `live_interrupt` — exact-session controls;
+- `live_reconcile` — проверить неизвестный submit по durable history, не повторяя его;
+- `live_reconnect` — новый WS generation + replay retained events;
+- `live_health` — auth/connection/replay/buffer health без LLM turn.
 
 Все tools возвращают JSON envelope:
 
@@ -82,6 +109,12 @@ MCP host увидит следующие tools (обычно с префиксо
 `run_status` после disconnect/restart является recovery authority. SSE — это
 наблюдение, а не замена status reconciliation.
 
+Для live `prompt.submit` acknowledgement без ответа помечается
+`status: "unknown", error_code: "transport_unknown"`. Bridge не отправляет
+такой prompt повторно — даже после перезапуска MCP процесса. Сначала вызывается
+`live_reconcile`; history match является evidence, но одинаковые повторные
+prompts нельзя различить абсолютно.
+
 ## Подключение ZCode через SSH
 
 Скопированный/установленный на сервере checkout можно подключить как обычный
@@ -94,7 +127,11 @@ MCP stdio service. Пример без credentials:
       "command": "ssh",
       "args": [
         "peetna-aws",
-        "/home/ubuntu/projects/hermes-zcode-bridge/scripts/run-bridge.sh"
+        "/home/ubuntu/projects/hermes-zcode-bridge/scripts/run-bridge.sh",
+        "--gateway-url",
+        "ws://100.77.100.96:9119/api/ws",
+        "--gateway-access-token-env",
+        "HERMES_DASHBOARD_ACCESS_TOKEN"
       ],
       "timeout": 180,
       "connect_timeout": 30
@@ -107,6 +144,14 @@ MCP stdio service. Пример без credentials:
 handshake и Python/Hermes startup происходят один раз на MCP session, а не на
 каждый prompt. При reconnect ZCode создаёт новый процесс; registry и API
 idempotency позволяют безопасно продолжить работу.
+
+`--gateway-url` — обычная настройка endpoint. Значение
+`HERMES_DASHBOARD_ACCESS_TOKEN` должно быть dashboard access token в server-side
+`.env` (не `API_SERVER_KEY` и не `HERMES_DASHBOARD_SESSION_TOKEN`). Bridge
+отправляет его только на `POST /api/auth/ws-ticket`, получает one-use ticket и
+передаёт ticket в `Sec-WebSocket-Protocol`; при каждом reconnect ticket
+выпускается заново. Если access token не настроен, live tools возвращают
+структурированный `gateway_auth_failed`, а durable API tools продолжают работать.
 
 `run-bridge.sh` выбирает Hermes venv, если он есть, добавляет `src` в
 `PYTHONPATH` и передаёт управление `python -m hermes_zcode_bridge.server`.
@@ -127,8 +172,10 @@ python3 -m compileall -q src
 Тесты используют fake transport и локальный fake HTTP server. Они проверяют
 MCP initialize/tools/list/tools/call, explicit session/provider, lane binding,
 request fingerprint, same-key reconciliation after timeout, exact stop/steer,
-wait, SSE parsing, history, error redaction и отсутствие secret в stderr.
-LLM-turn smoke намеренно deferred владельцем проекта.
+wait, SSE parsing, history, error redaction, persistent TUI WS, event replay,
+seq-gap race, ticket rotation и отсутствие secret в stderr. Настоящий
+loopback `websockets 15.0.1` smoke также прошёл с двумя WS generations и
+replay seq `[1, 2, 3, 4]`; LLM-turn smoke намеренно не запускался.
 
 ## API Server activation
 
@@ -155,13 +202,37 @@ API_SERVER_KEY=[REDACTED]
 передавайте key в URL. Если позже понадобится Tailscale bind, это отдельное
 решение с auth/firewall preflight.
 
+### Stage 2 live authentication
+
+Текущий `hermes-dashboard.service` слушает Tailscale `100.77.100.96:9119` и
+включает OAuth/basic auth gate. Его `HERMES_DASHBOARD_SESSION_TOKEN` — legacy
+loopback credential и **не** подходит для gated `/api/ws`; bridge намеренно
+получает `HTTP 403`/`gateway_auth_failed`, вместо обхода gate.
+
+Для live leg нужен один из вариантов:
+
+1. `HERMES_DASHBOARD_ACCESS_TOKEN` — dashboard access token; bridge отправляет
+   его на существующий `POST /api/auth/ws-ticket` и получает новый одноразовый
+   ticket на каждый WS connect/reconnect;
+2. `--gateway-ticket-env` — заранее выданный single-use ticket для одной
+   сессии (после disconnect требуется новый ticket);
+3. legacy `HERMES_DASHBOARD_SESSION_TOKEN` — только для loopback dashboard,
+   где auth gate выключен.
+
+`API_SERVER_KEY` относится только к `:8642` и не является заменой dashboard
+access token. Если live credential не настроен или отвергнут, Stage1 API tools
+остаются usable, а live tools сообщают точную причину.
+
 ## Границы Stage 1
 
 API run process и Hermes Desktop `hermes serve` — разные runtime/transport
 процессы. Stage 1 даёт durable job lane, status, recovery и control, но не
 обещает, что ZCode увидит live token stream Desktop. Shared live session,
 attach/reconnect/replay и совместная очередь prompt — Stage 2 через TUI
-WebSocket. A2A, peer/Bot Chat и public package release пока backlog.
+WebSocket. Stage 2 не создаёт новый agent runtime: он подключается вторым
+authenticated client к существующему `/api/ws`, поэтому Desktop и ZCode могут
+быть attached к одной session. A2A, peer/Bot Chat и public package release
+пока backlog.
 
 Issue `#94017` про повторный provider resolution persisted session остаётся
 отдельным Hermes risk. Перед использованием named `custom:*` provider нужно
