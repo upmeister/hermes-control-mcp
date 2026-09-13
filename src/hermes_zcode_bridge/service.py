@@ -17,7 +17,10 @@ class InputError(ValueError):
     """Caller input is unsafe or incomplete."""
 
 
-def _validate_text(value: str, field: str, *, max_length: int = 255, required: bool = True) -> str:
+def _validate_text(
+    value: str, field: str, *, max_length: int = 255, required: bool = True,
+    allow_common_whitespace: bool = False,
+) -> str:
     if value is None:
         value = ""
     if not isinstance(value, str):
@@ -26,7 +29,8 @@ def _validate_text(value: str, field: str, *, max_length: int = 255, required: b
         raise InputError(f"{field} must not be empty")
     if len(value) > max_length:
         raise InputError(f"{field} is too long")
-    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+    allowed = "\t\n\r" if allow_common_whitespace else ""
+    if any((ord(char) < 32 and char not in allowed) or ord(char) == 127 for char in value):
         raise InputError(f"{field} contains control characters")
     return value
 
@@ -140,7 +144,7 @@ class BridgeService:
     ) -> dict[str, Any]:
         try:
             lane = _validate_text(lane, "lane", max_length=200)
-            prompt = _validate_text(prompt, "prompt", max_length=100_000)
+            prompt = _validate_text(prompt, "prompt", max_length=100_000, allow_common_whitespace=True)
             if not prompt.strip():
                 raise InputError("prompt must not be blank")
             if session_id:
@@ -150,7 +154,9 @@ class BridgeService:
             if provider:
                 provider = _validate_text(provider, "provider")
             if instructions:
-                instructions = _validate_text(instructions, "instructions", max_length=100_000)
+                instructions = _validate_text(
+                    instructions, "instructions", max_length=100_000, allow_common_whitespace=True
+                )
             request_id = _visible_id(request_id, "request_id", max_length=128) if request_id else f"req_{uuid.uuid4().hex}"
             selected_session, lane_error = self._lane_session(lane, session_id)
             if lane_error is not None:
@@ -368,7 +374,7 @@ class BridgeService:
 
     def steer(self, *, text: str, lane: str | None = None, run_id: str | None = None) -> dict[str, Any]:
         try:
-            text = _validate_text(text, "text", max_length=100_000)
+            text = _validate_text(text, "text", max_length=100_000, allow_common_whitespace=True)
             if not text.strip():
                 raise InputError("text must not be blank")
             resolved_run, record, local_error = self._resolve_run(lane=lane, run_id=run_id)

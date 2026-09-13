@@ -108,6 +108,21 @@ class BridgeContractTests(unittest.TestCase):
         self.assertEqual(registry.session_for_lane("code/review"), "sid-1")
         self.assertEqual(len(transport.calls), 1)
 
+    def test_multiline_prompt_preserves_newlines_and_tabs(self):
+        prompt = "first line\n\tsecond line\r\nthird line"
+
+        def handler(method, url, headers, body, timeout):
+            self.assertEqual(json.loads(body)["input"], prompt)
+            return response(202, {"run_id": "run-multiline", "status": "started", "replayed": False})
+
+        service, _, _ = self.make_service(handler)
+        result = service.start(
+            lane="lane", prompt=prompt, session_id="sid-multiline", request_id="req-multiline"
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["run_id"], "run-multiline")
+
     def test_same_request_id_is_local_replay_without_second_post(self):
         calls = []
 
