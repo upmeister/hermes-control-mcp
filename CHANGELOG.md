@@ -4,6 +4,10 @@ All notable user-facing changes to this local bridge are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- Текущий Stage 2 target — cooperative local attach к общей Hermes Desktop/TUI session без Dashboard web-token; ChatGPT/OpenAI Tunnel path закрыт.
+
 ### Added
 
 - Initial MCP stdio bridge for Hermes Agent durable `/v1/runs`.

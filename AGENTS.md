@@ -13,7 +13,7 @@ contract tests without LLM calls. Stage 2 adds a thin live TUI WebSocket client
 and MCP facade; it does not embed Hermes core or replace Desktop/TUI. A2A/peer
 interoperability remains backlog.
 
-Stage 2 live surface:
+Stage 2 live surface (target; local shared attach is not yet production-ready):
 
 - `live_session_open` connects and creates/resumes a durable session;
 - `live_prompt` submits one prompt; `live_wait` waits for its start/complete pair;
@@ -22,11 +22,13 @@ Stage 2 live surface:
 - `live_reconnect` explicitly reconnects and replays retained per-session events;
 - `live_health` reports connection/auth/replay state without submitting a prompt.
 
-The live client uses the existing TUI `/api/ws` protocol. Gated dashboards require
-an operator-provided access token (optionally paired with a native refresh token)
-that mints a fresh one-use WS ticket; rotated credentials remain process-memory
-only. It never bypasses dashboard auth or reads browser cookies. Loopback legacy
-token auth is supported for local/SSH setups only.
+The target live client uses the existing TUI JSON-RPC/WS protocol through a
+cooperative local owner attach. The target must not require Dashboard access or
+refresh tokens, browser cookies, web tickets, `auth_required=false`, or a reused
+`API_SERVER_KEY`. Prefer an OS/process-bound Unix-socket boundary with owner lease,
+PID/liveness and profile fencing; loopback HTTP is acceptable only after the same
+admission boundary is proven. The current code retains historical token/ticket
+compatibility for tests, but it is not the deployment target.
 
 ## Source of truth and deployment
 

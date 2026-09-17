@@ -4,13 +4,7 @@
       "command": "ssh",
       "args": [
         "peetna-aws",
-        "/home/ubuntu/projects/hermes-zcode-bridge/scripts/run-bridge.sh",
-        "--gateway-url",
-        "ws://100.77.100.96:9119/api/ws",
-        "--gateway-access-token-env",
-        "HERMES_DASHBOARD_ACCESS_TOKEN",
-        "--gateway-refresh-token-env",
-        "HERMES_DASHBOARD_REFRESH_TOKEN"
+        "/home/ubuntu/projects/hermes-zcode-bridge/scripts/run-bridge.sh"
       ],
       "timeout": 180,
       "connect_timeout": 30
