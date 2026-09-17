@@ -14,3 +14,7 @@ htmlcov/
 .DS_Store
 dist/
 build/
+
+# Agent-local planning state; canonical plans live in Obsidian.
+.hermes/
+STAGE-1.5-UPDATED-PLAN-AND-RISKS.md
