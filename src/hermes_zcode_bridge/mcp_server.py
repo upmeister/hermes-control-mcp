@@ -20,14 +20,36 @@ _TOOL_DESCRIPTIONS = {
     "run_steer": "Queue course correction for one exact running Hermes run.",
     "session_history": "Read bounded durable message history for one exact Hermes session.",
     "bridge_health": "Run non-consuming Hermes health, models, and capabilities probes.",
-    "live_session_open": "Connect to the existing Hermes TUI WebSocket and create or resume one durable session lane.",
-    "live_prompt": "Submit one prompt to a live TUI session; never retries an unknown acknowledgement.",
+    "live_session_open": (
+        "Connect to the existing Hermes TUI WebSocket and create or resume one durable session lane. "
+        "Here session_id is the stored/durable ID to resume; the response session_id is the runtime ID "
+        "and stored_session_id is the durable ID. Prefer lane for subsequent reads and control calls."
+    ),
+    "live_prompt": (
+        "Submit one prompt to a live TUI session; never retries an unknown acknowledgement. "
+        "When supplied explicitly, session_id is the runtime ID; prefer lane instead of copying a stored ID."
+    ),
     "live_wait": "Wait for a live prompt's message.start/message.complete pair with a bounded timeout.",
-    "live_events": "Read bounded live TUI events after an optional per-session sequence cursor.",
-    "live_status": "Read exact live TUI session status without submitting a prompt.",
-    "live_history": "Read exact live TUI session history for recovery/reconciliation.",
-    "live_steer": "Queue exact-session live TUI steering text.",
-    "live_interrupt": "Interrupt the exact live TUI session turn cooperatively.",
+    "live_events": (
+        "Read bounded live TUI events after an optional per-session sequence cursor. "
+        "When supplied explicitly, session_id is the runtime ID; prefer lane instead of copying a stored ID."
+    ),
+    "live_status": (
+        "Read exact live TUI session status without submitting a prompt. "
+        "When supplied explicitly, session_id is the runtime ID; prefer lane instead of copying a stored ID."
+    ),
+    "live_history": (
+        "Read exact live TUI session history for recovery/reconciliation. "
+        "When supplied explicitly, session_id is the runtime ID; prefer lane instead of copying a stored ID."
+    ),
+    "live_steer": (
+        "Queue exact-session live TUI steering text. "
+        "When supplied explicitly, session_id is the runtime ID; prefer lane instead of copying a stored ID."
+    ),
+    "live_interrupt": (
+        "Interrupt the exact live TUI session cooperatively. "
+        "When supplied explicitly, session_id is the runtime ID; prefer lane instead of copying a stored ID."
+    ),
     "live_reconcile": "Reconcile an unknown live prompt against durable history without resubmitting it.",
     "live_reconnect": "Reconnect the live TUI WebSocket and replay retained per-session events.",
     "live_health": "Report live TUI connection, auth-mode, bounded-buffer, and replay state without an LLM turn.",
@@ -46,8 +68,11 @@ def create_server(service: BridgeService):
         "hermes-zcode-bridge",
         instructions=(
             "Thin Hermes Agent durable-runs and live-TUI bridge. Use exact lane/session/run/request identities. "
+            "For live_session_open, its session_id argument is a stored/durable ID; the response session_id "
+            "is the runtime ID and stored_session_id is durable. For live prompt/status/history/events/steer/interrupt, "
+            "an explicit session_id is a runtime ID; prefer lane for stable routing and never pass a stored ID there. "
             "Unknown transport outcomes require explicit reconciliation; live prompts are never silently retried. "
-            "The live TUI surface uses the existing /api/ws protocol and does not expose shell, CLI, configuration "
+            "The live TUI surface uses the private owner attach route and does not expose shell, CLI, configuration "
             "mutation, raw gateway dispatch, or slash commands."
         ),
     )
@@ -117,7 +142,11 @@ def create_server(service: BridgeService):
         provider: str = "",
         close_on_disconnect: bool = False,
     ) -> str:
-        """Open a persistent live lane; session_id is the durable id to resume, when supplied."""
+        """Open a live lane; supplied session_id is the stored/durable id to resume.
+
+        The response session_id is the ephemeral runtime id; prefer lane for
+        later reads and control calls.
+        """
         return _json_result(service.live_session_open(
             lane=lane, session_id=session_id or None, title=title or None, cwd=cwd or None,
             profile=profile or None, model=model or None, provider=provider or None,
@@ -132,7 +161,10 @@ def create_server(service: BridgeService):
         queued: bool = False,
         wait_seconds: float = 0.0,
     ) -> str:
-        """Submit one live prompt; wait_seconds optionally collects its final event."""
+        """Submit one live prompt; explicit session_id is a runtime id.
+
+        Prefer lane; wait_seconds optionally collects the final event.
+        """
         return _json_result(service.live_prompt(
             lane=lane, text=text, session_id=session_id or None,
             request_id=request_id or None, queued=queued, wait_seconds=wait_seconds,
@@ -145,25 +177,28 @@ def create_server(service: BridgeService):
         ))
 
     def live_events(lane: str = "", session_id: str = "", after_seq: int = 0) -> str:
-        """Read buffered live events without asking the backend to replay them."""
+        """Read buffered events; explicit session_id is a runtime id.
+
+        Prefer lane; this does not ask the backend to replay events.
+        """
         return _json_result(service.live_events(
             lane=lane or None, session_id=session_id or None, after_seq=after_seq,
         ))
 
     def live_status(lane: str = "", session_id: str = "") -> str:
-        """Read exact live session status."""
+        """Read live status; explicit session_id is a runtime id. Prefer lane."""
         return _json_result(service.live_status(lane=lane or None, session_id=session_id or None))
 
     def live_history(lane: str = "", session_id: str = "") -> str:
-        """Read exact live session history."""
+        """Read live history; explicit session_id is a runtime id. Prefer lane."""
         return _json_result(service.live_history(lane=lane or None, session_id=session_id or None))
 
     def live_steer(text: str, lane: str = "", session_id: str = "") -> str:
-        """Queue text into the exact live session."""
+        """Queue text; explicit session_id is a runtime id. Prefer lane."""
         return _json_result(service.live_steer(text=text, lane=lane or None, session_id=session_id or None))
 
     def live_interrupt(lane: str = "", session_id: str = "") -> str:
-        """Interrupt the exact live session."""
+        """Interrupt a live session; explicit session_id is a runtime id. Prefer lane."""
         return _json_result(service.live_interrupt(lane=lane or None, session_id=session_id or None))
 
     def live_reconcile(request_id: str) -> str:
