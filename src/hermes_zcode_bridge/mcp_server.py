@@ -29,7 +29,11 @@ _TOOL_DESCRIPTIONS = {
         "Submit one prompt to a live TUI session; never retries an unknown acknowledgement. "
         "When supplied explicitly, session_id is the runtime ID; prefer lane instead of copying a stored ID."
     ),
-    "live_wait": "Wait for a live prompt's message.start/message.complete pair with a bounded timeout.",
+    "live_wait": (
+        "Wait for this request's own live completion with a bounded timeout. Shared-session ownership "
+        "is proven via gateway inflight evidence; unprovable or foreign-turn cases return conservative "
+        "ambiguous_turn/completion_not_observed states instead of another client's answer."
+    ),
     "live_events": (
         "Read bounded live TUI events after an optional per-session sequence cursor. "
         "When supplied explicitly, session_id is the runtime ID; prefer lane instead of copying a stored ID."
@@ -50,7 +54,10 @@ _TOOL_DESCRIPTIONS = {
         "Interrupt the exact live TUI session cooperatively. "
         "When supplied explicitly, session_id is the runtime ID; prefer lane instead of copying a stored ID."
     ),
-    "live_reconcile": "Reconcile an unknown live prompt against durable history without resubmitting it.",
+    "live_reconcile": (
+        "Reconcile an unknown live prompt against post-boundary durable history (pre-submit row cursor) "
+        "without resubmitting it; ambiguous matches stay unknown."
+    ),
     "live_reconnect": "Reconnect the live TUI WebSocket and replay retained per-session events.",
     "live_health": "Report live TUI connection, auth-mode, bounded-buffer, and replay state without an LLM turn.",
 }

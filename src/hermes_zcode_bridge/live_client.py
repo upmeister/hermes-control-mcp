@@ -942,25 +942,20 @@ class LiveGatewayClient:
         with self._state_lock:
             return after_seq < self._event_evicted_through.get(session_id, 0)
 
-    def wait_for_completion(self, session_id: str, *, after_seq: int = 0, timeout: float = 120.0) -> dict[str, Any] | None:
-        """Wait for the next ``message.start`` → ``message.complete`` pair."""
+    def next_completion(self, session_id: str, *, after_seq: int = 0, timeout: float = 120.0) -> dict[str, Any] | None:
+        """Wait for the next ``message.complete`` event after ``after_seq``.
+
+        Returns ``None`` on timeout. Deliberately candidate-only: whether a
+        completion belongs to a specific bridge request is an ownership decision
+        the service makes with gateway-side evidence, not a buffer-order fact.
+        """
         deadline = time.monotonic() + max(0.0, timeout)
-        started = False
-        start_seq: int | None = None
         with self._events_condition:
             while True:
                 buffer = self._events.get(session_id) or ()
                 for item in buffer:
-                    if item.seq is not None and item.seq <= after_seq:
-                        continue
-                    kind = item.event.get("type")
-                    if not started and kind == "message.start":
-                        started = True
-                        start_seq = item.seq
-                        continue
-                    if started and kind == "message.complete":
-                        if start_seq is None or item.seq is None or item.seq > start_seq:
-                            return copy.deepcopy(item.event)
+                    if item.seq is not None and item.seq > after_seq and item.event.get("type") == "message.complete":
+                        return copy.deepcopy(item.event)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None

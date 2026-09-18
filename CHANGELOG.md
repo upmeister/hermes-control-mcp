@@ -4,6 +4,34 @@ All notable user-facing changes to this local bridge are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Live completion attribution: in a shared attached session, `live_wait` no
+  longer accepts the first `message.complete` after a sequence cursor as the
+  local answer. A submit acknowledged `streaming` proves ownership of the
+  running turn via the gateway inflight snapshot (`session.activate`, SHA-256
+  of the stripped prompt text) and a post-proof watermark; a foreign turn's
+  completion while the claimed turn is still running is skipped, and cases
+  where ownership cannot be proven return conservative `ambiguous_turn` /
+  `completion_not_observed` states instead of another client's answer.
+- Unknown-submit reconciliation is boundary-aware: `live_prompt` captures a
+  redacted pre-submit durable boundary (highest user `row_id`, row count) and
+  `live_reconcile` matches only post-boundary user rows. An older identical
+  prompt can no longer reconcile an ambiguous submit; multiple indistinguishable
+  post-boundary matches stay conservative (`ambiguous_history_match`); records
+  without boundary metadata never reconcile. Reconciliation now reads the
+  source-verified `text` field of gateway history rows (the previous code read
+  a `content` field the real gateway never returns).
+
+### Changed
+
+- `live_wait` on an already-terminal request replays the stored outcome instead
+  of re-waiting for a later (possibly foreign) completion.
+- Registry gains additive, redacted live-request columns (`attribution`,
+  `proof_seq`, `proof_epoch`, `inflight_sha256`, `boundary_row_id`,
+  `boundary_count`); existing databases upgrade in place and legacy rows
+  degrade conservatively.
+
 ### Changed
 
 - Stage 2 candidate now supports an explicit `--gateway-owner-lease` mode for

@@ -64,12 +64,34 @@ class StateRegistry:
                 runtime_session_id TEXT,
                 start_seq INTEGER,
                 error_code TEXT,
+                attribution TEXT,
+                proof_seq INTEGER,
+                proof_epoch TEXT,
+                inflight_sha256 TEXT,
+                boundary_row_id INTEGER,
+                boundary_count INTEGER,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS live_requests_by_lane ON live_requests(lane, updated_at DESC);
             """
         )
+        # Additive-only upgrade for databases created before the attribution
+        # columns existed. Legacy rows keep NULL in every new column and must
+        # degrade conservatively (never false-green) in live wait/reconcile.
+        for column in (
+            "attribution TEXT",
+            "proof_seq INTEGER",
+            "proof_epoch TEXT",
+            "inflight_sha256 TEXT",
+            "boundary_row_id INTEGER",
+            "boundary_count INTEGER",
+        ):
+            try:
+                self._conn.execute(f"ALTER TABLE live_requests ADD COLUMN {column}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
         self._conn.commit()
         self._tighten_permissions()
 
@@ -185,6 +207,12 @@ class StateRegistry:
         runtime_session_id: str | None = None,
         start_seq: int | None = None,
         error_code: str | None = None,
+        attribution: str | None = None,
+        proof_seq: int | None = None,
+        proof_epoch: str | None = None,
+        inflight_sha256: str | None = None,
+        boundary_row_id: int | None = None,
+        boundary_count: int | None = None,
     ) -> None:
         now = time.time()
         with self._lock:
@@ -192,22 +220,33 @@ class StateRegistry:
                 """INSERT INTO live_requests(
                        request_id, lane, session_id, prompt_sha256, fingerprint,
                        status, runtime_session_id, start_seq, error_code,
+                       attribution, proof_seq, proof_epoch, inflight_sha256,
+                       boundary_row_id, boundary_count,
                        created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(request_id) DO UPDATE SET
                        lane=excluded.lane, session_id=excluded.session_id,
                        prompt_sha256=excluded.prompt_sha256, fingerprint=excluded.fingerprint,
                        status=excluded.status, runtime_session_id=excluded.runtime_session_id,
                        start_seq=excluded.start_seq, error_code=excluded.error_code,
+                       attribution=excluded.attribution, proof_seq=excluded.proof_seq,
+                       proof_epoch=excluded.proof_epoch, inflight_sha256=excluded.inflight_sha256,
+                       boundary_row_id=excluded.boundary_row_id,
+                       boundary_count=excluded.boundary_count,
                        updated_at=excluded.updated_at""",
-                (request_id, lane, session_id, prompt_sha256, fingerprint, status,
-                 runtime_session_id, start_seq, error_code, now, now),
+                (request_id, lane, session_id, prompt_sha256, fingerprint,
+                 status, runtime_session_id, start_seq, error_code,
+                 attribution, proof_seq, proof_epoch, inflight_sha256,
+                 boundary_row_id, boundary_count, now, now),
             )
             self._conn.commit()
             self._tighten_permissions()
 
     def update_live_request(self, request_id: str, **fields: Any) -> None:
-        allowed = {"status", "runtime_session_id", "start_seq", "error_code", "session_id", "lane"}
+        allowed = {
+            "status", "runtime_session_id", "start_seq", "error_code", "session_id", "lane",
+            "attribution", "proof_seq", "proof_epoch",
+        }
         changes = {key: value for key, value in fields.items() if key in allowed}
         if not changes:
             return
