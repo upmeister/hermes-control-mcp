@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import socket
 import tempfile
 import threading
 import time
@@ -9,10 +11,12 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from hermes_zcode_bridge.config import BridgeConfig
 from hermes_zcode_bridge.live_client import LiveError, LiveGatewayClient, LiveTransportUnknown
+from hermes_zcode_bridge.local_attach import process_start_marker
 from hermes_zcode_bridge.live_service import LiveService
 from hermes_zcode_bridge.registry import StateRegistry
 
@@ -91,6 +95,16 @@ class FakeGateway:
                         "messages": [],
                     },
                 })
+            elif method == "session.activate":
+                socket.push({
+                    "jsonrpc": "2.0", "id": rid,
+                    "result": {
+                        "session_id": frame["params"]["session_id"],
+                        "stored_session_id": "stored-1",
+                        "message_count": 0,
+                        "messages": [],
+                    },
+                })
             elif method == "session.events.since":
                 self.replay_calls += 1
                 if self.mode == "race":
@@ -101,18 +115,23 @@ class FakeGateway:
                     })
                     socket.push({
                         "jsonrpc": "2.0", "id": rid,
-                        "result": {
-                            "events": [{"type": "message.delta", "session_id": "runtime-1", "seq": 3,
-                                        "payload": {"text": "gap"}}],
+ "result": {
+     "session_id": frame["params"]["session_id"],
+     "events": [{"type": "message.delta", "session_id": "runtime-1", "seq": 3,
+                 "payload": {"text": "gap"}}],
                             "latest_seq": 4,
                             "truncated": False,
                             "epoch": self.epoch,
+                            "count": 1,
+                            "open_requests": [],
                         },
                     })
                 else:
                     socket.push({
                         "jsonrpc": "2.0", "id": rid,
-                        "result": {"events": [], "latest_seq": 1, "truncated": False, "epoch": self.epoch},
+                        "result": {"session_id": frame["params"]["session_id"], "events": [],
+                                   "latest_seq": 1, "truncated": False, "epoch": self.epoch,
+                                   "count": 0, "open_requests": []},
                     })
             elif method == "prompt.submit":
                 self.prompt_calls += 1
@@ -188,6 +207,188 @@ class LiveClientTests(unittest.TestCase):
         query = parse_qs(urlsplit(client.last_connect_url).query)
         self.assertEqual(query["token"], ["gateway-test-token"])
         self.assertNotIn("subprotocols", gateway.connect_kwargs[0])
+        capabilities = [frame for frame in gateway.sockets[0].sent if frame.get("method") == "client.capabilities"]
+        self.assertEqual(len(capabilities), 1)
+        self.assertEqual(capabilities[0]["params"], {"server_requests": False})
+
+    def test_gateway_ready_without_replay_epoch_is_a_protocol_error(self):
+        gateway = FakeGateway()
+        config, _ = self.make_config(gateway)
+        client = LiveGatewayClient(config, connector=gateway.connect)
+        client._ready_event = asyncio.Event()
+
+        with self.assertRaisesRegex(LiveError, "replay_epoch") as caught:
+            client._handle_frame({
+                "jsonrpc": "2.0", "method": "event",
+                "params": {"type": "gateway.ready", "payload": {}},
+            })
+
+        self.assertEqual(caught.exception.code, "protocol_violation")
+        self.assertFalse(client._ready_event.is_set())
+
+    def test_invalid_json_rpc_envelope_is_fail_closed(self):
+        gateway = FakeGateway()
+        config, _ = self.make_config(gateway)
+        client = LiveGatewayClient(config, connector=gateway.connect)
+
+        for raw in (
+            '{"jsonrpc":"2.0","id":"z1","result":{},"result":{}}',
+            '{"jsonrpc":"2.0","id":"z1","result":{},"error":null}',
+            '{"jsonrpc":"2.0","id":"z1","result":{"value":1e999}}',
+        ):
+            with self.subTest(raw=raw):
+                with self.assertRaisesRegex(LiveError, "protocol"):
+                    client._handle_frame(raw)
+
+    def test_unexpected_server_request_gets_json_rpc_method_not_found(self):
+        gateway = FakeGateway()
+        config, _ = self.make_config(gateway)
+        client = LiveGatewayClient(config, connector=gateway.connect)
+
+        reply = client._handle_frame({
+            "jsonrpc": "2.0", "id": "srq-test", "method": "approval",
+            "params": {"session_id": "runtime-1"},
+        })
+
+        self.assertEqual(reply, {
+            "jsonrpc": "2.0", "id": "srq-test",
+            "error": {"code": -32601, "message": "server requests are not supported"},
+        })
+
+    def test_replay_validation_rejects_cross_session_gaps_and_truthy_truncated(self):
+        gateway = FakeGateway()
+        config, _ = self.make_config(gateway)
+        client = LiveGatewayClient(config, connector=gateway.connect)
+        client._replay_epoch = "epoch-1"
+        client._watermarks["session-a"] = 4
+        base = {
+            "session_id": "session-a",
+            "events": [],
+            "latest_seq": 4,
+            "truncated": False,
+            "count": 0,
+            "epoch": "epoch-1",
+            "open_requests": [],
+        }
+        cases = [
+            {**base, "events": [{"type": "message.delta", "session_id": "session-b", "seq": 5}], "latest_seq": 5, "count": 1},
+            {**base, "events": [{"type": "message.delta", "session_id": "session-a", "seq": 6}], "latest_seq": 6, "count": 1},
+            {**base, "truncated": "false"},
+        ]
+        for response in cases:
+            with self.subTest(response=response):
+                with self.assertRaises(ValueError):
+                    client._validate_replay_result("session-a", 4, response, [])
+                self.assertEqual(client.watermarks(), {"session-a": 4})
+
+    def test_duplicate_response_id_is_a_protocol_violation(self):
+        gateway = FakeGateway()
+        config, _ = self.make_config(gateway)
+        client = LiveGatewayClient(config, connector=gateway.connect)
+        self.addCleanup(client.shutdown)
+        client.connect()
+        client.request("gateway.ping", {})
+        response_id = client._retired_request_ids[-1]
+        with self.assertRaisesRegex(LiveError, "not pending"):
+            client._handle_frame({"jsonrpc": "2.0", "id": response_id, "result": {"ok": True}})
+
+    def test_close_drains_connection_task_after_outer_cancellation(self):
+        gateway = FakeGateway()
+        config, _ = self.make_config(gateway)
+        client = LiveGatewayClient(config, connector=gateway.connect)
+        self.addCleanup(client.shutdown)
+        client.connect()
+
+        async def cancel_disconnect():
+            task = asyncio.create_task(client._disconnect_async())
+            await asyncio.sleep(0)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            return client._connection_task
+
+        connection_task = client._run(cancel_disconnect(), timeout=3.0)
+        self.assertIsNotNone(connection_task)
+        self.assertTrue(connection_task.done())
+
+    def test_owner_global_event_with_empty_session_id_does_not_break_handshake(self):
+        gateway = FakeGateway()
+        config, _ = self.make_config(gateway)
+        client = LiveGatewayClient(config, connector=gateway.connect)
+        client._handle_frame({
+            "jsonrpc": "2.0", "method": "event",
+            "params": {"type": "setup.ready", "session_id": "", "payload": {"provider_configured": True}},
+        })
+        self.assertEqual(client.watermarks(), {})
+
+    def test_owner_health_is_configured_without_gateway_url(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lease = Path(tmp) / "owner.json"
+            gateway = FakeGateway()
+            config = BridgeConfig(
+                api_key="api-test", gateway_owner_lease_path=lease,
+                gateway_connect_timeout=1.0, gateway_request_timeout=1.0,
+                gateway_heartbeat_interval=0.0,
+            )
+            client = LiveGatewayClient(config, connector=gateway.connect)
+            self.addCleanup(client.shutdown)
+            service = LiveService(client, StateRegistry(Path(tmp) / "state.db"))
+            self.addCleanup(service.registry.close)
+            with patch.object(client, "connect", return_value=None):
+                result = service.health()
+            self.assertEqual(result["status"], "healthy")
+
+    def test_owner_attach_uses_unix_connect_and_never_injected_tcp_connector(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "owner"
+            runtime.mkdir(mode=0o700)
+            socket_path = runtime / "owner_adapter.sock"
+            lease_path = runtime / "owner_adapter.json"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(socket_path))
+            listener.listen(1)
+            socket_path.chmod(0o600)
+            lease_path.write_text(json.dumps({
+                "version": 1,
+                "runtime_id": "runtime-owner",
+                "pid": os.getpid(),
+                "process_start": process_start_marker(os.getpid()),
+                "profile_home": str(Path(tmp) / "profile"),
+                "socket_path": str(socket_path),
+                "lease_path": str(lease_path),
+                "route": "/api/owner/ws",
+                "transport": "websocket-unix",
+                "host": "127.0.0.1",
+                "port": 49119,
+            }), encoding="utf-8")
+            lease_path.chmod(0o600)
+            self.addCleanup(listener.close)
+
+            gateway = FakeGateway()
+            config = BridgeConfig(
+                api_key="api-test",
+                gateway_owner_lease_path=lease_path,
+                gateway_connect_timeout=1.0,
+                gateway_request_timeout=1.0,
+                gateway_heartbeat_interval=0.0,
+            )
+            def unexpected_tcp_connector(*_args, **_kwargs):
+                raise AssertionError("owner mode must not use the injected TCP connector")
+
+            client = LiveGatewayClient(config, connector=unexpected_tcp_connector)
+            self.addCleanup(client.shutdown)
+            with patch("websockets.asyncio.client.unix_connect", new=gateway.connect):
+                client.connect()
+
+            self.assertEqual(config.live_auth_mode(), "owner_adapter")
+            self.assertEqual(gateway.connect_urls, [str(socket_path.resolve())])
+            self.assertEqual(gateway.connect_kwargs[0]["uri"].split("?")[0], "ws://127.0.0.1:49119/api/owner/ws")
+            query = parse_qs(urlsplit(gateway.connect_kwargs[0]["uri"]).query)
+            self.assertEqual(query["runtime_id"], ["runtime-owner"])
+            self.assertNotIn("token", query)
+            self.assertNotIn("ticket", query)
 
     def test_access_token_mints_a_fresh_ticket_for_each_connection(self):
         tickets: list[str] = []
@@ -434,8 +635,10 @@ class LiveServiceTests(unittest.TestCase):
 
         resumed = service.open(lane="coding")
         self.assertEqual(resumed["session_id"], "runtime-resumed")
-        self.assertEqual(gateway.sockets[0].sent[0]["method"], "session.create")
-        self.assertEqual(gateway.sockets[0].sent[1]["method"], "session.resume")
+        methods = [frame["method"] for frame in gateway.sockets[0].sent]
+        self.assertEqual(methods, [
+            "client.capabilities", "session.create", "session.activate", "session.resume", "session.activate",
+        ])
 
     def test_unknown_prompt_is_not_resubmitted_for_same_request_id(self):
         gateway = FakeGateway()
