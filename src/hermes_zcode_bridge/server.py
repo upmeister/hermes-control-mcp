@@ -34,6 +34,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=120.0, help="HTTP request timeout in seconds")
     parser.add_argument("--poll-interval", type=float, default=0.5, help="Default wait polling interval")
     parser.add_argument("--gateway-url", help="Hermes TUI WebSocket URL, e.g. ws://127.0.0.1:9119/api/ws")
+    parser.add_argument(
+        "--gateway-owner-lease", type=Path,
+        help="Private local owner-adapter lease JSON (uses same-user Unix WebSocket; no dashboard token)",
+    )
     parser.add_argument("--gateway-http-url", help="Optional HTTP origin for /api/auth/ws-ticket")
     parser.add_argument(
         "--gateway-token-env", default=DEFAULT_GATEWAY_TOKEN_ENV,
@@ -80,6 +84,7 @@ def main(argv: list[str] | None = None) -> int:
             api_key_env=args.api_key_env,
             env_file=args.env_file,
             gateway_url=args.gateway_url,
+            gateway_owner_lease_path=args.gateway_owner_lease,
             gateway_http_url=args.gateway_http_url,
             gateway_token_env=args.gateway_token_env,
             gateway_access_token_env=args.gateway_access_token_env,

@@ -35,7 +35,8 @@ ZCode MCP stdio ──SSH──> bridge ──cooperative local attach──> ow
 
 Цель — оба клиента остаются attached к одному Hermes runtime. `session.resume`
 не забирает live lease: текущий Hermes `tui_gateway` fan-out'ит events всем
-attached clients. Сам local attach пока не объявлен готовым production-механизмом.
+attached clients. Stage 2 implementation реализует local attach как явный
+opt-in через private owner lease; production enablement остаётся отдельным gate.
 
 Bridge хранит в локальной SQLite только:
 
@@ -63,7 +64,7 @@ MCP host увидит следующие tools (обычно с префиксо
 
 Stage 2 live tools:
 
-- `live_session_open` — открыть или resume одну lane через configured cooperative local attach к owner TUI gateway (wire-compatible с `/api/ws`); результат
+- `live_session_open` — открыть или resume одну lane через configured cooperative local attach к owner TUI gateway (через отдельный private owner route, не Dashboard `/api/ws`); результат
   содержит `session_id` (runtime identity) и `stored_session_id` (durable identity);
 - `live_prompt` — отправить prompt в существующий TUI session; переносы строк и
   tab сохраняются буквально; `wait_seconds` опционально ждёт terminal event;
@@ -139,9 +140,16 @@ handshake и Python/Hermes startup происходят один раз на MCP
 каждый prompt. При reconnect ZCode создаёт новый процесс; registry и API
 idempotency позволяют безопасно продолжить работу.
 
-Эта конфигурация сейчас запускает durable MCP lane без Dashboard credentials.
-Live attach будет включён только после завершения local owner/lease spike и
-появления отдельного проверенного local attach mode. Ни web-token, ни
+Эта конфигурация запускает durable MCP lane без Dashboard credentials. Для
+opt-in local attach bridge принимает явный путь lease:
+
+```bash
+python -m hermes_zcode_bridge.server --gateway-owner-lease \
+  "$HERMES_HOME/runtime/owner_adapter/owner_adapter.json"
+```
+
+Owner-side gate `dashboard.owner_adapter.enabled` по умолчанию выключен.
+Ни web-token, ни
 `HERMES_DASHBOARD_ACCESS_TOKEN`, ни `HERMES_DASHBOARD_REFRESH_TOKEN` в ZCode args
 или текущем deployment contract не нужны.
 
@@ -165,10 +173,11 @@ python3 -m compileall -q src
 MCP initialize/tools/list/tools/call, explicit session/provider, lane binding,
 request fingerprint, same-key reconciliation after timeout, exact stop/steer,
 wait, SSE parsing, history, error redaction, persistent TUI WS, event replay,
-seq-gap race, ticket/refresh rotation и отсутствие secret в stderr. Настоящий
-loopback `websockets 15.0.1` smoke также прошёл с двумя WS generations и
-replay seq `[1, 2, 3, 4]`; three strict repetitions and the 30-test suite are
-green; LLM-turn smoke намеренно не запускался.
+seq-gap race, ticket/refresh rotation и отсутствие secret в stderr. Настоящий `websockets 15.0.1` smoke для private UDS owner surface и
+bridge→owner attach прошёл; disposable existing-session fixture также прошёл
+с `session.resume`, `session.activate`, сохранением исходного Desktop-like
+клиента и двумя bridge WS generations. Полный bridge suite: 47 тестов green;
+LLM-turn smoke намеренно не запускался.
 
 ## API Server activation
 
@@ -195,32 +204,43 @@ API_SERVER_KEY=[REDACTED]
 передавайте key в URL. Если позже понадобится Tailscale bind, это отдельное
 решение с auth/firewall preflight.
 
-### Stage 2 live access — текущий план
+### Stage 2 live access — owner adapter (opt-in; disabled by default)
 
-Текущий target — cooperative local attach к owner Hermes TUI gateway без
-Dashboard access/refresh/session tokens и без одноразового web ticket. Upstream
-уже содержит active-session lease и client-side `shared_session_attach.py`, но
-server-side `/api/session-attach` в проверенном `origin/main` не найден; поэтому
-этот путь пока является spike, а не готовым endpoint.
+Owner surface использует отдельный route `/api/owner/ws` на private Unix
+socket, подключённый к тому же uvicorn/event loop и `tui_gateway`, что и
+обычный Hermes runtime. Это не второй Hermes runtime и не переиспользование
+Dashboard `/api/ws`.
+
+Lease содержит только runtime/profile/process identity и endpoint metadata:
+`runtime_id`, PID, process-start marker, `profile_home`, socket/lease paths,
+route и protocol version. Owner route дополнительно проверяет UDS scope,
+private permissions, неизменённый lease и живой PID/start marker. Bridge
+проверяет lease/socket identity и передаёт только identity query; token/ticket
+из lease или Dashboard config не копируются.
+
+Подтверждено в disposable process fixture: публикация lease, UDS handshake,
+`gateway.ready`, `gateway.ping`, rejection wrong identity/TCP bypass, cleanup,
+existing-session resume/activate, rebind и reconnect. Owner adapter gate
+остаётся выключенным по умолчанию; production service не перезапускался.
 
 Предпочтительная граница — Unix socket с filesystem permissions, owner lease,
 PID/liveness и profile fencing. Loopback HTTP допустим только если тот же набор
 проверок закрывает admission boundary. `auth_required=false`, legacy `?token=`
 и использование `internal_ws_credential` из независимого bridge запрещены.
 
-До local attach bridge должен учесть upstream `client.capabilities` после
-`gateway.ready`; пока server→client approvals/clarify не поддерживаются, bridge
-должен объявлять capability `false` и fail-closed обрабатывать неожиданные
-requests.
+После `gateway.ready` bridge отправляет `client.capabilities` с
+`server_requests=false`: bridge не является интерактивным approval/clarify
+клиентом и не должен перехватывать server→client requests у Desktop.
 
 ## Границы Stage 1
 
 API run process и Hermes Desktop `hermes serve` — разные runtime/transport
 процессы. Stage 1 даёт durable job lane, status, recovery и control. Stage 2
-уже реализует transport/replay core; текущая незавершённая часть — доказанный
-local cooperative attach вторым client к существующему owner runtime без web
-token. Production concurrency/LLM gate ждёт local attach и отдельное разрешение
-на consuming turn. A2A, peer/Bot Chat и public package release пока backlog.
+transport/replay core; Stage 2 implementation добавляет доказанный local
+cooperative attach вторым client к существующему owner runtime без web token.
+Security/integration review для этого scope получил GO; production
+concurrency/LLM smoke и owner enablement остаются отдельными opt-in gates.
+A2A, peer/Bot Chat и public package release пока backlog.
 
 Issue `#94017` про повторный provider resolution persisted session остаётся
 отдельным Hermes risk. Перед использованием named `custom:*` provider нужно

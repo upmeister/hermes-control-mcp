@@ -111,6 +111,9 @@ class BridgeConfig:
     env_file: Path | None = None
     # Live TUI gateway. URL is behavioral configuration; credentials remain env/file-only.
     gateway_url: str | None = None
+    # Explicit local owner-adapter lease. This mode uses a same-user Unix socket
+    # and never resolves dashboard credentials or web tickets.
+    gateway_owner_lease_path: Path | None = None
     gateway_http_url: str | None = None
     gateway_token: str | None = field(default=None, repr=False)
     gateway_token_env: str = DEFAULT_GATEWAY_TOKEN_ENV
@@ -128,6 +131,7 @@ class BridgeConfig:
     gateway_event_buffer_max: int = 512
     gateway_event_buffer_bytes: int = 4 * 1024 * 1024
     gateway_event_buffer_total_bytes: int = 64 * 1024 * 1024
+    gateway_event_sessions_max: int = 256
 
     def __post_init__(self) -> None:
         self.api_url = self.api_url.rstrip("/")
@@ -136,6 +140,8 @@ class BridgeConfig:
         self.state_db = Path(self.state_db).expanduser()
         if self.env_file is not None:
             self.env_file = Path(self.env_file).expanduser()
+        if self.gateway_owner_lease_path is not None:
+            self.gateway_owner_lease_path = Path(self.gateway_owner_lease_path).expanduser()
         if self.request_timeout <= 0:
             raise ConfigError("request_timeout must be positive")
         if self.poll_interval <= 0:
@@ -153,7 +159,12 @@ class BridgeConfig:
                 raise ConfigError(f"{name} must be positive")
         if self.gateway_heartbeat_interval < 0:
             raise ConfigError("gateway_heartbeat_interval must not be negative")
-        if self.gateway_event_buffer_max < 1 or self.gateway_event_buffer_bytes < 1 or self.gateway_event_buffer_total_bytes < 1:
+        if (
+            self.gateway_event_buffer_max < 1
+            or self.gateway_event_buffer_bytes < 1
+            or self.gateway_event_buffer_total_bytes < 1
+            or self.gateway_event_sessions_max < 1
+        ):
             raise ConfigError("live event buffer limits must be positive")
 
     def resolved_api_key(self) -> str:
@@ -172,6 +183,8 @@ class BridgeConfig:
         return _resolve_secret(self.gateway_refresh_token, self.gateway_refresh_token_env, self.env_file or (hermes_home() / ".env"))
 
     def live_auth_mode(self) -> str:
+        if self.gateway_owner_lease_path is not None:
+            return "owner_adapter"
         if self.resolved_gateway_access_token() and self.resolved_gateway_refresh_token():
             return "access_token_refresh"
         if self.resolved_gateway_access_token():

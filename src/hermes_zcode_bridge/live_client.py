@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import math
 import threading
 import time
 from collections import OrderedDict, deque
@@ -11,6 +12,82 @@ from typing import Any, Awaitable, Callable, Coroutine
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .config import BridgeConfig
+
+
+_JSON_MISSING = object()
+_MAX_RPC_ID_CHARS = 128
+_MAX_METHOD_CHARS = 128
+_MAX_EVENT_TYPE_CHARS = 128
+_MAX_SESSION_ID_CHARS = 255
+_MAX_REPLAY_EPOCH_CHARS = 128
+_MAX_EVENT_PAYLOAD_BYTES = 4 * 1024 * 1024
+_MAX_FRAME_BYTES = 16 * 1024 * 1024
+
+
+def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON member: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_non_finite_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def _finite_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("non-finite JSON number")
+    return parsed
+
+
+def _strict_json_loads(raw: str | bytes) -> Any:
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("frame is not valid UTF-8") from exc
+    if not isinstance(raw, str):
+        raise ValueError("frame is not JSON text")
+    if len(raw.encode("utf-8")) > _MAX_FRAME_BYTES:
+        raise ValueError("frame exceeds the maximum size")
+    return json.loads(
+        raw,
+        object_pairs_hook=_reject_duplicate_pairs,
+        parse_constant=_reject_non_finite_constant,
+        parse_float=_finite_float,
+    )
+
+
+def _bounded_text(value: Any, *, field: str, max_chars: int) -> str:
+    if not isinstance(value, str) or not value or len(value) > max_chars:
+        raise ValueError(f"{field} is invalid")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        raise ValueError(f"{field} contains control characters")
+    if len(value.encode("utf-8")) > max_chars * 4:
+        raise ValueError(f"{field} is too large")
+    return value
+
+
+def _rpc_id(value: Any) -> str:
+    return _bounded_text(value, field="JSON-RPC id", max_chars=_MAX_RPC_ID_CHARS)
+
+
+def _protocol_error(message: str) -> LiveError:
+    return LiveError(f"live gateway protocol violation: {message}", code="protocol_violation")
+
+
+def _validate_rpc_error(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) - {"code", "message", "data"} or "code" not in value or "message" not in value:
+        raise ValueError("JSON-RPC error object is invalid")
+    code = value["code"]
+    if type(code) is not int or not -32768 <= code <= 32768:
+        raise ValueError("JSON-RPC error code is invalid")
+    _bounded_text(value["message"], field="JSON-RPC error message", max_chars=512)
+    return value
 
 
 class LiveError(RuntimeError):
@@ -92,9 +169,13 @@ class LiveGatewayClient:
         self._connect_error: LiveError | None = None
         self._next_id = 0
         self._pending: dict[str, _PendingCall] = {}
+        self._retired_request_ids: deque[str] = deque(maxlen=512)
+        self._retired_request_id_set: set[str] = set()
         self._replay_epoch: str | None = None
         self._epoch_changed_on_connect = False
         self._replay_hold: dict[str, list[dict[str, Any]]] | None = None
+        self._replay_hold_bytes = 0
+        self._replay_gap_allowed: set[str] = set()
         self._last_replay: dict[str, Any] = {
             "replayed": 0, "truncated": [], "errors": [], "epoch_changed": False,
         }
@@ -169,6 +250,11 @@ class LiveGatewayClient:
             return future.result(timeout=timeout)
         except TimeoutError as exc:
             future.cancel()
+            try:
+                cleanup = asyncio.run_coroutine_threadsafe(self._disconnect_async(), loop)
+                cleanup.result(timeout=7.0)
+            except Exception:
+                pass
             if method in self._LIVE_MUTATIONS:
                 raise LiveTransportUnknown() from exc
             raise LiveError("live gateway operation timed out", code="gateway_timeout") from exc
@@ -198,6 +284,7 @@ class LiveGatewayClient:
         except asyncio.TimeoutError as exc:
             if self._connection_task is not None:
                 self._connection_task.cancel()
+                await self._cancel_and_drain_task(self._connection_task)
             self._set_state("error")
             raise LiveError("live gateway did not send gateway.ready", code="gateway_ready_timeout") from exc
         if self._connect_error is not None:
@@ -205,6 +292,17 @@ class LiveGatewayClient:
             raise error
         if self._state != "open":
             raise LiveError("live gateway closed during handshake", code="gateway_connect_failed")
+        try:
+            # Hermes uses this one-shot handshake to decide whether it may send
+            # approval/clarify/secret/vault requests. Bridge has no handler for
+            # those server→client requests, so advertise false explicitly.
+            await self._call_async(
+                "client.capabilities", {"server_requests": False},
+                timeout=min(10.0, self.config.gateway_request_timeout),
+            )
+        except LiveError:
+            await self._disconnect_async()
+            raise
         if self._epoch_changed_on_connect:
             self._last_replay = {
                 "replayed": 0, "truncated": [], "errors": [], "epoch_changed": True,
@@ -217,12 +315,9 @@ class LiveGatewayClient:
         socket = None
         ready = self._ready_event
         try:
-            url = await asyncio.to_thread(self._connect_parameters)
+            owner_target = await asyncio.to_thread(self._owner_attach_target)
+            url = owner_target.uri if owner_target is not None else await asyncio.to_thread(self._connect_parameters)
             self._last_connect_url = url
-            connector = self._connector
-            if connector is None:
-                from websockets.asyncio.client import connect
-                connector = connect
             kwargs = {
                 "open_timeout": self.config.gateway_connect_timeout,
                 "close_timeout": 5.0,
@@ -232,12 +327,24 @@ class LiveGatewayClient:
                 "max_size": self._MAX_FRAME_BYTES,
                 "proxy": None,
             }
-            socket = await connector(url, **kwargs)
+            if owner_target is not None:
+                from websockets.asyncio.client import unix_connect
+
+                socket = await unix_connect(str(owner_target.socket_path), uri=url, **kwargs)
+            else:
+                connector = self._connector
+                if connector is None:
+                    from websockets.asyncio.client import connect
+
+                    connector = connect
+                socket = await connector(url, **kwargs)
             self._socket = socket
             while True:
                 raw = await asyncio.wait_for(socket.recv(), timeout=self.config.gateway_connect_timeout)
                 self._last_inbound = time.monotonic()
-                self._handle_frame(raw)
+                response = self._handle_frame(raw)
+                if response is not None:
+                    await socket.send(json.dumps(response, ensure_ascii=False, separators=(",", ":")))
                 if ready is not None and ready.is_set():
                     break
             if ready is None or not ready.is_set():
@@ -247,7 +354,9 @@ class LiveGatewayClient:
             while True:
                 raw = await socket.recv()
                 self._last_inbound = time.monotonic()
-                self._handle_frame(raw)
+                response = self._handle_frame(raw)
+                if response is not None:
+                    await socket.send(json.dumps(response, ensure_ascii=False, separators=(",", ":")))
         except LiveError as exc:
             if ready is not None and not ready.is_set():
                 self._connect_error = exc
@@ -270,9 +379,10 @@ class LiveGatewayClient:
             elif self._state not in {"closing", "closed"}:
                 self._set_state("closed")
         finally:
-            if self._heartbeat_task is not None:
-                self._heartbeat_task.cancel()
-                self._heartbeat_task = None
+            heartbeat = self._heartbeat_task
+            self._heartbeat_task = None
+            if heartbeat is not None and heartbeat is not asyncio.current_task():
+                await self._cancel_and_drain_task(heartbeat)
             if socket is not None:
                 try:
                     await socket.close()
@@ -340,18 +450,47 @@ class LiveGatewayClient:
     async def _disconnect_async(self) -> None:
         self._set_state("closing")
         socket, task = self._socket, self._connection_task
-        if socket is not None:
+        try:
+            if socket is not None:
+                try:
+                    await socket.close()
+                except Exception:
+                    pass
+        finally:
+            if task is not None and task is not asyncio.current_task():
+                await self._cancel_and_drain_task(task)
+            self._fail_pending_unknown()
+            self._set_state("closed")
+
+    @staticmethod
+    async def _cancel_and_drain_task(task: asyncio.Task) -> None:
+        """Cancel a transport task and await it so no reader survives close()."""
+        if task.done():
             try:
-                await socket.close()
-            except Exception:
+                task.result()
+            except BaseException:
                 pass
-        if task is not None and task is not asyncio.current_task() and not task.done():
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
-            except Exception:
+            return
+        await asyncio.sleep(0)
+        if task.done():
+            return
+        task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+        except BaseException:
+            # A transport may have its own cancellation cleanup. Deliver a second
+            # cancellation and yield once before the bounded drain wait; this
+            # closes the common "caught cancel, then await cleanup" race.
+            for _ in range(2):
+                if task.done():
+                    break
                 task.cancel()
-        self._fail_pending_unknown()
-        self._set_state("closed")
+                await asyncio.sleep(0)
+            if not task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+                except BaseException:
+                    pass
 
     def shutdown(self) -> None:
         """Stop the private event loop during bridge process shutdown."""
@@ -396,12 +535,20 @@ class LiveGatewayClient:
             await socket.send(json.dumps(frame, ensure_ascii=False, separators=(",", ":")))
         except Exception as exc:
             self._pending.pop(request_id, None)
+            self._retire_request_id(request_id)
             raise LiveTransportUnknown() if method in self._LIVE_MUTATIONS else LiveError(
                 "live gateway send failed", code="gateway_send_failed") from exc
         try:
             return await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+        except asyncio.CancelledError:
+            self._pending.pop(request_id, None)
+            self._retire_request_id(request_id)
+            if not future.done():
+                future.cancel()
+            raise
         except asyncio.TimeoutError as exc:
             self._pending.pop(request_id, None)
+            self._retire_request_id(request_id)
             if method in self._LIVE_MUTATIONS:
                 raise LiveTransportUnknown() from exc
             raise LiveError("live gateway request timed out", code="gateway_timeout") from exc
@@ -409,45 +556,119 @@ class LiveGatewayClient:
     def _fail_pending_unknown(self) -> None:
         for request_id, pending in list(self._pending.items()):
             self._pending.pop(request_id, None)
+            self._retire_request_id(request_id)
             if not pending.future.done():
                 pending.future.set_exception(LiveTransportUnknown())
 
-    def _handle_frame(self, raw: Any) -> None:
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", errors="replace")
-        try:
-            frame = json.loads(raw)
-        except (TypeError, json.JSONDecodeError):
+    def _retire_request_id(self, request_id: str) -> None:
+        if request_id in self._retired_request_id_set:
             return
+        if len(self._retired_request_ids) == self._retired_request_ids.maxlen:
+            oldest = self._retired_request_ids.popleft()
+            self._retired_request_id_set.discard(oldest)
+        self._retired_request_ids.append(request_id)
+        self._retired_request_id_set.add(request_id)
+
+    @staticmethod
+    def _rpc_error_frame(code: int, message: str, request_id: str | None) -> dict[str, Any]:
+        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+
+    @staticmethod
+    def _validate_envelope(frame: Any) -> tuple[str, str | None, dict[str, Any] | None]:
         if not isinstance(frame, dict):
-            return
-        request_id = frame.get("id")
-        if request_id is not None:
-            pending = self._pending.pop(str(request_id), None)
+            raise _protocol_error("JSON-RPC frame must be an object")
+        if frame.get("jsonrpc") != "2.0":
+            raise _protocol_error("JSON-RPC version must be 2.0")
+        if "method" in frame:
+            method = _bounded_text(frame.get("method"), field="JSON-RPC method", max_chars=_MAX_METHOD_CHARS)
+            if method == "event":
+                if set(frame) != {"jsonrpc", "method", "params"} or not isinstance(frame.get("params"), dict):
+                    raise _protocol_error("event notification envelope is invalid")
+                return "event", None, frame["params"]
+            if set(frame) - {"jsonrpc", "id", "method", "params"}:
+                raise _protocol_error("server request envelope contains unknown members")
+            raw_id = frame.get("id", _JSON_MISSING)
+            if raw_id is _JSON_MISSING:
+                return "invalid_server_request", None, None
+            try:
+                request_id = _rpc_id(raw_id)
+            except ValueError:
+                return "invalid_server_request", None, None
+            if "params" in frame and not isinstance(frame["params"], dict):
+                return "invalid_server_request", None, None
+            return "server_request", request_id, frame.get("params") or {}
+        if set(frame) - {"jsonrpc", "id", "result", "error"}:
+            raise _protocol_error("response envelope contains unknown members")
+        if "id" not in frame:
+            raise _protocol_error("response id is missing")
+        try:
+            request_id = _rpc_id(frame["id"])
+        except ValueError as exc:
+            raise _protocol_error(str(exc)) from exc
+        has_result = "result" in frame
+        has_error = "error" in frame
+        if has_result == has_error:
+            raise _protocol_error("response must contain exactly one of result or error")
+        if has_error:
+            try:
+                _validate_rpc_error(frame["error"])
+            except ValueError as exc:
+                raise _protocol_error(str(exc)) from exc
+        return "response", request_id, frame
+
+    def _handle_frame(self, raw: Any) -> dict[str, Any] | None:
+        try:
+            frame = _strict_json_loads(raw) if isinstance(raw, (str, bytes)) else raw
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise _protocol_error(str(exc)) from exc
+        kind, request_id, payload = self._validate_envelope(frame)
+        if kind == "invalid_server_request":
+            return self._rpc_error_frame(-32600, "invalid request", None)
+        if kind == "server_request":
+            return self._rpc_error_frame(-32601, "server requests are not supported", request_id)
+        if kind == "response":
+            assert isinstance(payload, dict) and request_id is not None
+            pending = self._pending.pop(request_id, None)
             if pending is None or pending.future.done():
-                return
-            if isinstance(frame.get("error"), dict):
-                error = frame["error"]
-                pending.future.set_exception(LiveRPCError(error.get("code"), str(error.get("message") or "Hermes RPC failed"), error.get("data")))
+                raise _protocol_error(f"response id is not pending: {request_id}")
+            self._retire_request_id(request_id)
+            if "error" in payload:
+                error = payload["error"]
+                pending.future.set_exception(LiveRPCError(error["code"], error["message"], error.get("data")))
             else:
-                pending.future.set_result(frame.get("result"))
-            return
-        if frame.get("method") != "event" or not isinstance(frame.get("params"), dict):
-            return
-        event = frame["params"]
+                pending.future.set_result(payload["result"])
+            return None
+        assert kind == "event" and isinstance(payload, dict)
+        event = payload
         if event.get("type") == "gateway.ready":
-            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-            epoch = payload.get("replay_epoch")
-            if isinstance(epoch, str) and epoch:
-                self._adopt_replay_epoch(epoch)
+            ready_payload = event.get("payload")
+            if not isinstance(ready_payload, dict):
+                raise _protocol_error("gateway.ready payload is invalid")
+            try:
+                epoch = _bounded_text(ready_payload.get("replay_epoch"), field="replay_epoch", max_chars=_MAX_REPLAY_EPOCH_CHARS)
+            except ValueError as exc:
+                raise _protocol_error(str(exc)) from exc
+            self._adopt_replay_epoch(epoch)
             if self._ready_event is not None:
                 self._ready_event.set()
-            return
-        sid = event.get("session_id")
-        if isinstance(sid, str) and self._replay_hold is not None and sid in self._replay_hold:
-            self._replay_hold[sid].append(copy.deepcopy(event))
-            return
+            return None
+        try:
+            sid = self._validate_event(event)
+        except ValueError as exc:
+            raise _protocol_error(str(exc)) from exc
+        if sid is not None and self._replay_hold is not None and sid in self._replay_hold:
+            parked = self._replay_hold[sid]
+            size = self._event_size(event)
+            if len(parked) >= self.config.gateway_event_buffer_max or size > self.config.gateway_event_buffer_bytes:
+                raise _protocol_error("replay capture limit exceeded")
+            current_bytes = getattr(self, "_replay_hold_bytes", 0)
+            if current_bytes + size > self.config.gateway_event_buffer_total_bytes:
+                raise _protocol_error("replay capture limit exceeded")
+            parked.append(copy.deepcopy(event))
+            self._replay_hold_bytes = current_bytes + size
+            return None
         self._accept_event(event)
+        return None
 
     def _adopt_replay_epoch(self, epoch: str) -> None:
         if self._replay_epoch is not None and self._replay_epoch != epoch:
@@ -457,6 +678,7 @@ class LiveGatewayClient:
                 self._event_bytes.clear()
                 self._event_evicted_through.clear()
                 self._event_total_bytes = 0
+                self._replay_gap_allowed.clear()
             self._epoch_changed_on_connect = True
         self._replay_epoch = epoch
 
@@ -474,26 +696,78 @@ class LiveGatewayClient:
         value = event.get("seq")
         return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
-    def _accept_event(self, event: dict[str, Any]) -> None:
+    @staticmethod
+    def _validate_event(event: dict[str, Any], *, expected_session: str | None = None) -> str | None:
+        try:
+            encoded_size = len(json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise ValueError("event payload is not JSON-serializable") from exc
+        if encoded_size > _MAX_EVENT_PAYLOAD_BYTES:
+            raise ValueError("event payload exceeds the maximum size")
+        event_type = _bounded_text(event.get("type"), field="event type", max_chars=_MAX_EVENT_TYPE_CHARS)
+        if "session_id" not in event:
+            if "seq" in event:
+                raise ValueError("sessionless event must not carry seq")
+            return None
+        raw_session_id = event.get("session_id")
+        if raw_session_id == "":
+            if "seq" in event:
+                raise ValueError("sessionless event must not carry seq")
+            if expected_session is not None:
+                raise ValueError("event session_id does not match requested session")
+            return None
+        sid = _bounded_text(raw_session_id, field="event session_id", max_chars=_MAX_SESSION_ID_CHARS)
+        if expected_session is not None and sid != expected_session:
+            raise ValueError("event session_id does not match requested session")
+        seq = event.get("seq")
+        if type(seq) is not int or seq < 1:
+            raise ValueError("event seq is invalid")
+        if expected_session is not None and seq > 0:
+            return sid
+        return sid
+
+    def _drop_session_state(self, sid: str) -> None:
+        buffer = self._events.pop(sid, None)
+        if buffer is not None:
+            self._event_total_bytes -= self._event_bytes.pop(sid, 0)
+        else:
+            self._event_bytes.pop(sid, None)
+        self._watermarks.pop(sid, None)
+        self._event_evicted_through.pop(sid, None)
+        self._replay_gap_allowed.discard(sid)
+
+    def _ensure_session_slot(self, sid: str) -> bool:
+        if sid in self._watermarks:
+            return True
+        limit = getattr(self.config, "gateway_event_sessions_max", 256)
+        if len(self._watermarks) >= limit:
+            oldest = next(iter(self._watermarks), None)
+            if oldest is None:
+                return False
+            self._drop_session_state(oldest)
+        self._watermarks[sid] = 0
+        return True
+
+    def _accept_event(self, event: dict[str, Any], *, allow_gap: bool = False) -> bool:
+        sid = self._validate_event(event)
+        if sid is None:
+            return False
+        seq = event["seq"]
         with self._events_condition:
-            if not isinstance(event, dict) or not event.get("type"):
-                return
-            sid = event.get("session_id")
-            seq = self._event_seq(event)
-            if isinstance(sid, str) and seq is not None:
-                previous = self._watermarks.get(sid, 0)
-                if seq <= previous:
-                    return
-                self._watermarks[sid] = seq
-            if not isinstance(sid, str) or not sid:
-                return
+            if not self._ensure_session_slot(sid):
+                return False
+            previous = self._watermarks.get(sid, 0)
+            if seq <= previous:
+                return False
+            if previous and seq != previous + 1 and not allow_gap and sid not in self._replay_gap_allowed:
+                return False
+            self._watermarks[sid] = seq
             stored = copy.deepcopy(event)
             size = self._event_size(stored)
             if size > self.config.gateway_event_buffer_bytes:
-                if seq is not None:
-                    self._event_evicted_through[sid] = max(self._event_evicted_through.get(sid, 0), seq)
+                self._event_evicted_through[sid] = max(self._event_evicted_through.get(sid, 0), seq)
                 self._events_condition.notify_all()
-                return
+                return True
             buffer = self._events.get(sid)
             if buffer is None:
                 buffer = deque()
@@ -525,61 +799,131 @@ class LiveGatewayClient:
                 if not removed_any:
                     break
             self._events_condition.notify_all()
+            return True
+
+    def _validate_replay_result(
+        self, sid: str, last_seen: int, result: Any, parked: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], bool]:
+        if not isinstance(result, dict):
+            raise ValueError("replay response is not an object")
+        required = {"session_id", "events", "latest_seq", "truncated", "count", "epoch", "open_requests"}
+        if set(result) != required:
+            raise ValueError("replay response shape is invalid")
+        if result.get("session_id") != sid:
+            raise ValueError("replay response session_id does not match request")
+        events = result.get("events")
+        if not isinstance(events, list) or len(events) > self.config.gateway_event_buffer_max:
+            raise ValueError("replay events are invalid")
+        latest_seq = result.get("latest_seq")
+        if type(latest_seq) is not int or latest_seq < 0:
+            raise ValueError("replay latest_seq is invalid")
+        truncated = result.get("truncated")
+        if type(truncated) is not bool:
+            raise ValueError("replay truncated must be boolean")
+        if result.get("count") != len(events):
+            raise ValueError("replay count is inconsistent")
+        epoch = result.get("epoch")
+        if not isinstance(epoch, str) or not epoch or len(epoch) > _MAX_REPLAY_EPOCH_CHARS:
+            raise ValueError("replay epoch is invalid")
+        if self._replay_epoch is not None and epoch != self._replay_epoch:
+            raise ValueError("replay epoch changed")
+        if not isinstance(result.get("open_requests"), list) or len(result["open_requests"]) > self.config.gateway_event_buffer_max:
+            raise ValueError("replay open_requests is invalid")
+        replay_events: list[dict[str, Any]] = []
+        for event in events:
+            if not isinstance(event, dict):
+                raise ValueError("replay event is not an object")
+            try:
+                self._validate_event(event, expected_session=sid)
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
+            replay_events.append(event)
+        parked_events: list[dict[str, Any]] = []
+        for event in parked:
+            if not isinstance(event, dict):
+                raise ValueError("parked event is not an object")
+            self._validate_event(event, expected_session=sid)
+            parked_events.append(event)
+        combined = list(replay_events)
+        previous = last_seen
+        for event in replay_events:
+            seq = event["seq"]
+            if seq <= previous:
+                raise ValueError("replay sequence regressed or duplicated")
+            if not truncated and seq != previous + 1:
+                raise ValueError("replay sequence is not contiguous")
+            previous = seq
+        duplicate_parked_seqs: set[int] = set()
+        for event in parked_events:
+            seq = event["seq"]
+            if seq == previous and combined and event == combined[-1] and seq not in duplicate_parked_seqs:
+                # A live frame may race with replay and be returned by both
+                # channels. It is safe to discard exactly one byte-identical
+                # duplicate; conflicting or repeated duplicates stay fatal.
+                duplicate_parked_seqs.add(seq)
+                continue
+            if seq <= previous:
+                raise ValueError("parked event regressed or duplicated")
+            if not truncated and seq != previous + 1:
+                raise ValueError("parked sequence is not contiguous")
+            combined.append(event)
+            previous = seq
+        if latest_seq < last_seen or latest_seq < (previous if combined else last_seen):
+            raise ValueError("replay latest_seq is behind validated events")
+        if not truncated and latest_seq != (previous if combined else last_seen):
+            raise ValueError("replay latest_seq is inconsistent")
+        return combined, truncated
 
     async def _replay_async(self) -> dict[str, Any]:
         with self._state_lock:
-            entries = list(self._watermarks.items())
-            hold = {sid: [] for sid, _last_seen in entries}
-            self._replay_hold = hold
+            entries = list(self._watermarks.items())[:getattr(self.config, "gateway_event_sessions_max", 256)]
         replayed = 0
         truncated: list[str] = []
         errors: list[str] = []
-        try:
-            for sid, last_seen in entries:
-                try:
-                    result = await self._call_async(
-                        "session.events.since", {"session_id": sid, "last_seen": last_seen},
-                        timeout=min(10.0, self.config.gateway_request_timeout),
-                    )
-                except LiveError as exc:
-                    errors.append(exc.code)
-                    continue
-                if not isinstance(result, dict):
-                    errors.append("invalid_replay_response")
-                    continue
-                epoch = result.get("epoch")
-                if isinstance(epoch, str) and epoch:
-                    if self._replay_epoch is not None and epoch != self._replay_epoch:
-                        self._adopt_replay_epoch(epoch)
-                        errors.append("replay_epoch_changed")
-                        continue
-                    self._replay_epoch = epoch
-                if result.get("truncated"):
-                    truncated.append(sid)
-                events = result.get("events")
-                if not isinstance(events, list):
-                    continue
-                for event in events:
-                    if isinstance(event, dict):
-                        before = self._watermarks.get(sid, 0)
-                        self._accept_event(event)
-                        if self._watermarks.get(sid, 0) > before:
-                            replayed += 1
-        finally:
+        epoch_changed = False
+        for sid, snapshot_last_seen in entries:
             with self._state_lock:
-                parked = self._replay_hold or {}
-                self._replay_hold = None
-            for events in parked.values():
-                for event in events:
-                    before = self._watermarks.get(event.get("session_id", ""), 0)
-                    self._accept_event(event)
-                    if self._watermarks.get(event.get("session_id", ""), 0) > before:
-                        replayed += 1
+                last_seen = self._watermarks.get(sid, snapshot_last_seen)
+                self._replay_hold = {sid: []}
+                self._replay_hold_bytes = 0
+            valid = False
+            result: Any = None
+            try:
+                result = await self._call_async(
+                    "session.events.since", {"session_id": sid, "last_seen": last_seen},
+                    timeout=min(10.0, self.config.gateway_request_timeout),
+                )
+                parked = list(self._replay_hold.get(sid, [])) if self._replay_hold is not None else []
+                combined, is_truncated = self._validate_replay_result(sid, last_seen, result, parked)
+                if is_truncated:
+                    truncated.append(sid)
+                    self._replay_gap_allowed.add(sid)
+                replay_count = len(combined)
+                for event in combined:
+                    if not self._accept_event(event, allow_gap=is_truncated):
+                        raise ValueError("validated replay event was not accepted")
+                replayed += replay_count
+                valid = True
+            except LiveError as exc:
+                errors.append(exc.code)
+            except ValueError as exc:
+                errors.append("invalid_replay_response")
+                if "replay epoch changed" in str(exc) and isinstance(result, dict):
+                    epoch = result.get("epoch")
+                    if isinstance(epoch, str) and epoch:
+                        self._adopt_replay_epoch(epoch)
+                        epoch_changed = True
+            finally:
+                with self._state_lock:
+                    self._replay_hold = None
+                    self._replay_hold_bytes = 0
+                if not valid:
+                    continue
         return {
             "replayed": replayed,
             "truncated": truncated,
             "errors": errors,
-            "epoch_changed": bool("replay_epoch_changed" in errors),
+            "epoch_changed": epoch_changed,
         }
 
     def watermarks(self) -> dict[str, int]:
@@ -641,6 +985,17 @@ class LiveGatewayClient:
             }
 
     # ----- authentication ------------------------------------------------
+
+    def _owner_attach_target(self):
+        lease_path = self.config.gateway_owner_lease_path
+        if lease_path is None:
+            return None
+        from .local_attach import OwnerAttachError, load_owner_attach_target
+
+        try:
+            return load_owner_attach_target(lease_path)
+        except OwnerAttachError as exc:
+            raise LiveError(str(exc), code="owner_attach_failed") from exc
 
     def _connect_parameters(self) -> str:
         if not self.config.gateway_url:

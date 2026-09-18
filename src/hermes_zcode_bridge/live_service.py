@@ -174,6 +174,16 @@ class LiveService:
             stored = reply.get("stored_session_id") or reply.get("resumed") or target
             if not isinstance(runtime, str) or not runtime or not isinstance(stored, str) or not stored:
                 return self._result(status="failed", error_code="invalid_response", error="Hermes live session response omitted session identity")
+            activated = self.client.request("session.activate", {"session_id": runtime, "omit_messages": True})
+            if not isinstance(activated, dict) or activated.get("session_id") != runtime:
+                return self._result(
+                    status="failed", error_code="invalid_response",
+                    error="Hermes live session activation did not confirm the runtime session identity",
+                )
+            activated_stored = activated.get("stored_session_id") or stored
+            if not isinstance(activated_stored, str) or not activated_stored:
+                return self._result(status="failed", error_code="invalid_response", error="Hermes live session activation omitted stored identity")
+            stored = activated_stored
             self.registry.bind_lane(lane, stored)
             self._remember_runtime(lane, runtime, stored)
             result = self._result(
@@ -455,10 +465,13 @@ class LiveService:
             return self._error(exc)
 
     def health(self) -> dict[str, Any]:
-        if not self.client.config.gateway_url:
+        configured = bool(
+            self.client.config.gateway_url or self.client.config.gateway_owner_lease_path is not None
+        )
+        if not configured:
             return self._result(
                 status="unconfigured", error_code="gateway_not_configured",
-                error="gateway_url is not configured; live tools are disabled",
+                error="gateway_url or gateway_owner_lease_path is not configured; live tools are disabled",
                 connection=self.client.health(),
             )
         if self.client.state != "open":

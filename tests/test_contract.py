@@ -330,6 +330,15 @@ class ConfigContractTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             BridgeConfig(api_key="api", gateway_url="wss://gateway.test/api/ws?token=secret")
 
+    def test_owner_lease_is_a_distinct_local_auth_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = BridgeConfig(
+                api_key="api",
+                gateway_owner_lease_path=Path(tmp) / "owner_adapter.json",
+            )
+
+        self.assertEqual(config.live_auth_mode(), "owner_adapter")
+
 
 class MCPContractTests(unittest.TestCase):
     def test_mcp_surface_is_allowlisted(self):
