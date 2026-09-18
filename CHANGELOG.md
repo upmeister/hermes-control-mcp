@@ -12,6 +12,11 @@ All notable user-facing changes to this local bridge are documented here.
 - Owner mode is disabled/unconfigured by default, advertises
   `client.capabilities(server_requests=false)`, preserves stored/runtime
   session identities, and keeps the durable Stage 1 lane as fallback.
+- MCP live-tool descriptions now distinguish the stored/durable ID accepted by
+  `live_session_open` from the runtime ID used by explicit live read/control
+  arguments; lane-based routing is documented as the stable default.
+- The ZCode Stage 2 example uses the `hermes_stage2` server name and deployed
+  private-owner lease command instead of the legacy durable-only entry.
 
 ### Added
 
