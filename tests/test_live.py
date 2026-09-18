@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import socket
+import sqlite3
 import tempfile
 import threading
 import time
@@ -56,6 +57,13 @@ class FakeSocket:
 
 
 class FakeGateway:
+    """Scripted stand-in for the deployed TUI gateway's client-visible contract.
+
+    Models the source-verified session state the bridge relies on: a running
+    flag, the inflight turn's stripped user text (exposed by session.activate),
+    per-session event sequence numbers, and durable history rows with row_id.
+    """
+
     def __init__(self):
         self.sockets: list[FakeSocket] = []
         self.connect_kwargs: list[dict] = []
@@ -65,6 +73,33 @@ class FakeGateway:
         self.replay_calls = 0
         self.session_counter = 0
         self.mode = "normal"
+        self.complete_delay: float | None = 0.15
+        self.inflight_enabled = True
+        self.history_rows: list[dict] = []
+        self.turns: dict[str, dict] = {}
+
+    def turn_state(self, session_id: str) -> dict:
+        return self.turns.setdefault(session_id, {"running": False, "inflight_user": None, "seq": 0})
+
+    def emit_event(self, socket: FakeSocket, session_id: str, kind: str, payload: dict | None = None) -> int:
+        state = self.turn_state(session_id)
+        state["seq"] += 1
+        params: dict = {"type": kind, "session_id": session_id, "seq": state["seq"]}
+        if payload is not None:
+            params["payload"] = payload
+        socket.push({"jsonrpc": "2.0", "method": "event", "params": params})
+        return state["seq"]
+
+    def inject_foreign_turn(self, socket: FakeSocket, session_id: str, text: str = "foreign-answer") -> None:
+        self.emit_event(socket, session_id, "message.start")
+        self.emit_event(socket, session_id, "message.complete", {"status": "complete", "text": text})
+
+    def _complete_turn(self, socket: FakeSocket, session_id: str) -> None:
+        state = self.turn_state(session_id)
+        state["running"] = False
+        state["inflight_user"] = None
+        self.history_rows.append({"role": "assistant", "text": "done", "row_id": len(self.history_rows) + 1})
+        self.emit_event(socket, session_id, "message.complete", {"status": "complete", "text": "done"})
 
     async def connect(self, url: str, **kwargs):
         self.connect_urls.append(url)
@@ -96,15 +131,20 @@ class FakeGateway:
                     },
                 })
             elif method == "session.activate":
-                socket.push({
-                    "jsonrpc": "2.0", "id": rid,
-                    "result": {
-                        "session_id": frame["params"]["session_id"],
-                        "stored_session_id": "stored-1",
-                        "message_count": 0,
-                        "messages": [],
-                    },
-                })
+                result = {
+                    "session_id": frame["params"]["session_id"],
+                    "stored_session_id": "stored-1",
+                    "message_count": 0,
+                    "messages": [],
+                }
+                if self.inflight_enabled:
+                    state = self.turn_state(frame["params"]["session_id"])
+                    result["running"] = state["running"]
+                    if state["running"]:
+                        result["inflight"] = {
+                            "user": state["inflight_user"] or "", "assistant": "", "streaming": True,
+                        }
+                socket.push({"jsonrpc": "2.0", "id": rid, "result": result})
             elif method == "session.events.since":
                 self.replay_calls += 1
                 if self.mode == "race":
@@ -138,20 +178,23 @@ class FakeGateway:
                 if self.mode == "unknown":
                     await socket.close()
                     return
+                if self.mode == "busy":
+                    socket.push({"jsonrpc": "2.0", "id": rid, "result": {"status": "queued"}})
+                    return
+                session_id = frame["params"]["session_id"]
+                state = self.turn_state(session_id)
+                state["running"] = True
+                state["inflight_user"] = frame["params"]["text"]
                 socket.push({"jsonrpc": "2.0", "id": rid, "result": {"status": "streaming"}})
-                socket.push({
-                    "jsonrpc": "2.0", "method": "event",
-                    "params": {"type": "message.start", "session_id": frame["params"]["session_id"], "seq": 1},
-                })
-                socket.push({
-                    "jsonrpc": "2.0", "method": "event",
-                    "params": {"type": "message.complete", "session_id": frame["params"]["session_id"], "seq": 2,
-                               "payload": {"status": "complete", "text": "done"}},
-                })
+                self.emit_event(socket, session_id, "message.start")
+                if self.complete_delay is not None:
+                    asyncio.get_running_loop().call_later(
+                        self.complete_delay, self._complete_turn, socket, session_id)
             elif method == "session.status":
                 socket.push({"jsonrpc": "2.0", "id": rid, "result": {"output": "Hermes TUI Status"}})
             elif method == "session.history":
-                socket.push({"jsonrpc": "2.0", "id": rid, "result": {"messages": []}})
+                messages = [dict(row) for row in self.history_rows]
+                socket.push({"jsonrpc": "2.0", "id": rid, "result": {"count": len(messages), "messages": messages}})
             elif method == "session.steer":
                 socket.push({"jsonrpc": "2.0", "id": rid, "result": {"status": "queued"}})
             elif method == "session.interrupt":
@@ -702,6 +745,256 @@ class LiveServiceTests(unittest.TestCase):
         )
         self.assertTrue(second["replayed"])
         self.assertEqual(gateway.prompt_calls, 1)
+
+    # ----- H1: shared-turn completion attribution --------------------------
+
+    def test_foreign_completion_between_submit_and_local_turn_is_rejected(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = 0.5
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        socket = gateway.sockets[0]
+        runtime = opened["session_id"]
+
+        timer = threading.Timer(0.2, lambda: gateway.inject_foreign_turn(socket, runtime, "foreign-answer"))
+        timer.start()
+        self.addCleanup(timer.join, 1.0)
+
+        result = service.prompt(
+            lane="coding", session_id=runtime, text="local question", request_id="live-foreign", wait_seconds=2,
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["answer"], "done")
+        self.assertNotEqual(result.get("answer"), "foreign-answer")
+
+    def test_foreign_completion_alone_never_satisfies_local_wait(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        runtime = opened["session_id"]
+        service.prompt(
+            lane="coding", session_id=runtime, text="local question", request_id="live-foreign-only",
+        )
+        gateway.inject_foreign_turn(gateway.sockets[0], runtime, "foreign-answer")
+
+        waited = service.wait(request_id="live-foreign-only", timeout_seconds=0.5)
+
+        self.assertEqual(waited["status"], "running")
+        self.assertEqual(waited["error_code"], "wait_timeout")
+        self.assertIsNone(waited.get("answer"))
+
+    def test_queued_submit_wait_is_conservative(self):
+        gateway = FakeGateway()
+        gateway.mode = "busy"
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+
+        result = service.prompt(
+            lane="coding", session_id=opened["session_id"], text="queued question",
+            request_id="live-queued", queued=True, wait_seconds=1,
+        )
+
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(result["attribution"], "unproven")
+        waited = service.wait(request_id="live-queued", timeout_seconds=1)
+        self.assertEqual(waited["error_code"], "ambiguous_turn")
+        self.assertIsNone(waited.get("answer"))
+        self.assertEqual(gateway.prompt_calls, 1)
+
+    def test_unprovable_claim_keeps_wait_conservative_even_with_buffered_completion(self):
+        gateway = FakeGateway()
+        gateway.inflight_enabled = False
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+
+        result = service.prompt(
+            lane="coding", session_id=opened["session_id"], text="no proof",
+            request_id="live-noproof",
+        )
+
+        self.assertEqual(result["status"], "streaming")
+        self.assertEqual(result["attribution"], "unproven")
+        waited = service.wait(request_id="live-noproof", timeout_seconds=0.5)
+        self.assertEqual(waited["error_code"], "ambiguous_turn")
+        self.assertIsNone(waited.get("answer"))
+
+    def test_wait_after_rotation_reports_completion_not_observed(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        service.prompt(
+            lane="coding", session_id=opened["session_id"], text="lost turn", request_id="live-rotate-wait",
+        )
+        gateway.epoch = "epoch-2"
+
+        service.reconnect()
+        waited = service.wait(request_id="live-rotate-wait", timeout_seconds=0.5)
+
+        self.assertEqual(waited["status"], "unknown")
+        self.assertEqual(waited["error_code"], "completion_not_observed")
+        self.assertIsNone(waited.get("answer"))
+
+    def test_wait_after_rotation_reproves_still_running_turn(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        text = "still running"
+        service.prompt(
+            lane="coding", session_id=opened["session_id"], text=text, request_id="live-rotate-running",
+        )
+        gateway.epoch = "epoch-2"
+
+        service.reconnect()
+        resumed_state = gateway.turn_state("runtime-resumed")
+        resumed_state["running"] = True
+        resumed_state["inflight_user"] = text
+
+        waited = service.wait(request_id="live-rotate-running", timeout_seconds=0.4)
+
+        self.assertEqual(waited["status"], "running")
+        self.assertEqual(waited["error_code"], "wait_timeout")
+        self.assertIsNone(waited.get("answer"))
+
+    # ----- H2: boundary-aware unknown-submit reconciliation -----------------
+
+    def test_reconcile_ignores_older_identical_prompt(self):
+        gateway = FakeGateway()
+        gateway.history_rows = [{"role": "user", "text": "same text", "row_id": 1}]
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        gateway.mode = "unknown"
+        submitted = service.prompt(
+            lane="coding", session_id=opened["session_id"], text="same text", request_id="live-old",
+        )
+        self.assertEqual(submitted["status"], "unknown")
+        gateway.mode = "normal"
+
+        result = service.reconcile(request_id="live-old")
+
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["reconciliation"], "not_observed")
+
+    def test_reconcile_matches_post_boundary_prompt(self):
+        gateway = FakeGateway()
+        gateway.history_rows = [{"role": "user", "text": "old unrelated", "row_id": 1}]
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        gateway.mode = "unknown"
+        service.prompt(
+            lane="coding", session_id=opened["session_id"], text="retry text", request_id="live-new",
+        )
+        gateway.mode = "normal"
+        gateway.history_rows.append({"role": "user", "text": "retry text", "row_id": 2})
+
+        result = service.reconcile(request_id="live-new")
+
+        self.assertEqual(result["status"], "reconciled")
+        self.assertEqual(result["reconciliation"], "history_match_post_boundary")
+
+    def test_reconcile_identical_prompts_across_boundary_count_only_post_boundary(self):
+        gateway = FakeGateway()
+        gateway.history_rows = [{"role": "user", "text": "same text", "row_id": 1}]
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        gateway.mode = "unknown"
+        service.prompt(
+            lane="coding", session_id=opened["session_id"], text="same text", request_id="live-across",
+        )
+        gateway.mode = "normal"
+        gateway.history_rows.append({"role": "user", "text": "same text", "row_id": 2})
+
+        result = service.reconcile(request_id="live-across")
+
+        self.assertEqual(result["status"], "reconciled")
+        self.assertEqual(result["reconciliation"], "history_match_post_boundary")
+
+    def test_reconcile_multiple_post_boundary_identical_prompts_stay_conservative(self):
+        gateway = FakeGateway()
+        gateway.history_rows = [{"role": "user", "text": "seed", "row_id": 1}]
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        gateway.mode = "unknown"
+        service.prompt(
+            lane="coding", session_id=opened["session_id"], text="dup", request_id="live-dup",
+        )
+        gateway.mode = "normal"
+        gateway.history_rows.extend([
+            {"role": "user", "text": "dup", "row_id": 2},
+            {"role": "user", "text": "dup", "row_id": 3},
+        ])
+
+        result = service.reconcile(request_id="live-dup")
+
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["error_code"], "ambiguous_history_match")
+        self.assertEqual(result["reconciliation"], "post_boundary_ambiguous")
+
+    def test_reconcile_without_boundary_metadata_is_conservative(self):
+        gateway = FakeGateway()
+        service, registry = self.make_service(gateway)
+        service.open(lane="coding")
+        registry.save_live_request(
+            request_id="legacy", lane="coding", session_id="stored-1",
+            prompt_sha256="0" * 64, fingerprint="legacy-fp", status="unknown",
+        )
+        gateway.history_rows = [{"role": "user", "text": "whatever", "row_id": 1}]
+
+        result = service.reconcile(request_id="legacy")
+
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["error_code"], "reconcile_boundary_missing")
+        self.assertEqual(result["reconciliation"], "legacy_record_without_boundary")
+
+    def test_legacy_registry_database_gets_attribution_columns(self):
+        gateway = FakeGateway()
+        service, registry = self.make_service(gateway)
+        registry.close()
+        legacy_path = registry.path
+        legacy_path.unlink()
+
+        conn = sqlite3.connect(legacy_path)
+        conn.executescript(
+            """
+            CREATE TABLE lanes (lane TEXT PRIMARY KEY, session_id TEXT NOT NULL, updated_at REAL NOT NULL);
+            CREATE TABLE requests (
+                request_id TEXT PRIMARY KEY, lane TEXT NOT NULL, session_id TEXT, run_id TEXT,
+                idempotency_key TEXT NOT NULL UNIQUE, fingerprint TEXT NOT NULL, status TEXT NOT NULL,
+                error_code TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL
+            );
+            CREATE TABLE live_requests (
+                request_id TEXT PRIMARY KEY, lane TEXT NOT NULL, session_id TEXT NOT NULL,
+                prompt_sha256 TEXT NOT NULL, fingerprint TEXT NOT NULL, status TEXT NOT NULL,
+                runtime_session_id TEXT, start_seq INTEGER, error_code TEXT,
+                created_at REAL NOT NULL, updated_at REAL NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO live_requests(request_id, lane, session_id, prompt_sha256, fingerprint, status,"
+            " created_at, updated_at) VALUES ('legacy-row', 'coding', 'stored-1', '0hash', 'fp', 'unknown', 0, 0)"
+        )
+        conn.commit()
+        conn.close()
+
+        reopened = StateRegistry(legacy_path)
+        self.addCleanup(reopened.close)
+        reopened.save_live_request(
+            request_id="fresh", lane="coding", session_id="stored-1",
+            prompt_sha256="1" * 64, fingerprint="fp2", status="pending",
+            attribution="claimed", proof_seq=4, proof_epoch="epoch-1",
+            inflight_sha256="2" * 64, boundary_row_id=0, boundary_count=0,
+        )
+        record = reopened.live_request_by_id("fresh")
+        assert record is not None
+        self.assertEqual(record["attribution"], "claimed")
+        self.assertEqual(record["boundary_row_id"], 0)
+        legacy = reopened.live_request_by_id("legacy-row")
+        assert legacy is not None
+        self.assertIsNone(legacy["boundary_row_id"])
 
 
 if __name__ == "__main__":
