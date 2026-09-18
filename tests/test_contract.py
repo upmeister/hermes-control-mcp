@@ -368,6 +368,37 @@ class MCPContractTests(unittest.TestCase):
         self.assertNotIn("shell_exec", names)
         self.assertNotIn("cli_exec", names)
 
+    def test_live_session_id_descriptions_separate_stored_and_runtime_namespaces(self):
+        from hermes_zcode_bridge.mcp_server import create_server
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = BridgeConfig(api_url="http://bridge.test", api_key="x", state_db=Path(tmp) / "state.db")
+            registry = StateRegistry(config.state_db)
+            self.addCleanup(registry.close)
+            service = BridgeService(
+                HermesAPIClient(config, transport=FakeTransport(lambda *args: response(200, {}))),
+                registry,
+            )
+            server = create_server(service)
+            tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
+
+        open_description = (tools["live_session_open"].description or "").lower()
+        self.assertIn("session_id is the stored/durable id", open_description)
+        self.assertIn("response session_id is the runtime id", open_description)
+        self.assertIn("prefer lane", open_description)
+
+        for name in {
+            "live_prompt",
+            "live_events",
+            "live_status",
+            "live_history",
+            "live_steer",
+            "live_interrupt",
+        }:
+            description = (tools[name].description or "").lower()
+            self.assertIn("explicitly, session_id is the runtime id", description, name)
+            self.assertIn("prefer lane", description, name)
+
 
 if __name__ == "__main__":
     unittest.main()

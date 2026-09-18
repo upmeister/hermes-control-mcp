@@ -65,13 +65,18 @@ MCP host увидит следующие tools (обычно с префиксо
 Stage 2 live tools:
 
 - `live_session_open` — открыть или resume одну lane через configured cooperative local attach к owner TUI gateway (через отдельный private owner route, не Dashboard `/api/ws`); результат
-  содержит `session_id` (runtime identity) и `stored_session_id` (durable identity);
+  содержит `session_id` (runtime identity) и `stored_session_id` (durable identity). Аргумент
+  `session_id` здесь — stored/durable ID;
 - `live_prompt` — отправить prompt в существующий TUI session; переносы строк и
   tab сохраняются буквально; `wait_seconds` опционально ждёт terminal event;
+  при явном `session_id` это runtime ID, поэтому для обычного потока предпочитай `lane`;
 - `live_wait` — дождаться пары `message.start` → `message.complete`;
 - `live_events` — прочитать bounded in-memory event buffer после `after_seq`;
-- `live_status` / `live_history` — recovery reads;
-- `live_steer` / `live_interrupt` — exact-session controls;
+  при явном `session_id` это runtime ID, поэтому предпочитай `lane`;
+- `live_status` / `live_history` — recovery reads; при явном `session_id` ожидают
+  runtime ID, для стабильного доступа используй `lane`;
+- `live_steer` / `live_interrupt` — exact-session controls; явный `session_id`
+  также является runtime ID, поэтому предпочитай `lane`;
 - `live_reconcile` — проверить неизвестный submit по durable history, не повторяя его;
 - `live_reconnect` — новый WS generation + replay retained events;
 - `live_health` — auth/connection/replay/buffer health без LLM turn.
@@ -120,14 +125,25 @@ prompts нельзя различить абсолютно.
 ## Подключение ZCode через SSH
 
 Скопированный/установленный на сервере checkout можно подключить как обычный
-MCP stdio service. Пример без credentials:
+MCP stdio service. Для Stage 2 используй private owner lease, а не Dashboard
+credentials или публичный `/api/ws`:
 
 ```json
 {
   "mcpServers": {
-    "hermes_bridge": {
+    "hermes_stage2": {
       "command": "ssh",
-      "args": ["example-host", "/path/to/hermes-control-mcp/scripts/run-bridge.sh"],
+      "args": [
+        "-T",
+        "example-host",
+        "/path/to/hermes-control-mcp/scripts/run-bridge.sh",
+        "--gateway-owner-lease",
+        "/path/to/owner_adapter.json",
+        "--state-db",
+        "/path/to/bridge-state.db",
+        "--log-level",
+        "WARNING"
+      ],
       "timeout": 180,
       "connect_timeout": 30
     }
