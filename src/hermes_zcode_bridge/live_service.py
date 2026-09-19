@@ -470,6 +470,16 @@ class LiveService:
                 proof_epoch=self.client.health().get("replay_epoch"),
                 proof_generation=self.client.connection_generation(),
             )
+        if self.client.replay_degraded(runtime):
+            # This connection's replay lost events (for any runtime id — a
+            # resume rotates the id, and the degradation must survive that);
+            # buffered ordering cannot attribute completions.
+            return self._result(
+                status="unknown", request_id=request_id, session_id=runtime, stored_session_id=stored,
+                error_code="completion_not_observed", replayed=True,
+                error="Replay for this connection was truncated; use live_reconcile/live_history for durable recovery.",
+                attribution=attribution,
+            )
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -524,15 +534,30 @@ class LiveService:
                     error="Replay for this session was truncated; use live_reconcile/live_history for durable recovery.",
                     attribution=attribution,
                 )
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            raw_status = str(payload.get("status") or "complete")
             inflight_user = snapshot.get("inflight_user")
             if inflight_user is not None:
                 if self._inflight_matches(snapshot, inflight_sha):
                     if snapshot.get("inflight_error"):
-                        # Our claimed turn FAILED: the gateway retains the failed
-                        # inflight snapshot (with the error marker) while emitting
-                        # the terminal completion, so this candidate is our
-                        # failure and must be reported.
-                        pass
+                        if raw_status == "error":
+                            # Our claimed turn FAILED: the gateway retains the
+                            # failed inflight snapshot (with the error marker)
+                            # while emitting the terminal failure completion, so
+                            # this candidate is our failure and must be
+                            # reported. A success payload under a retained
+                            # failure snapshot is a non-conforming ordering and
+                            # must never be attributed.
+                            pass
+                        else:
+                            return self._result(
+                                status="unknown", request_id=request_id, session_id=runtime,
+                                stored_session_id=stored,
+                                error_code="completion_not_observed", replayed=True,
+                                error=("The claimed turn failed but the buffered completion is not its terminal "
+                                       "event; use live_reconcile/live_history for durable recovery."),
+                                attribution=attribution,
+                            )
                     else:
                         # The proven running turn is ours and healthy; its
                         # completion cannot have been emitted yet (the gateway
@@ -561,8 +586,6 @@ class LiveService:
             # gate no foreign completion can precede ours after the proof
             # cursor on a continuous connection, so this candidate is the
             # local completion.
-            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-            raw_status = str(payload.get("status") or "complete")
             status = {"complete": "completed", "error": "failed", "cancelled": "interrupted"}.get(raw_status, raw_status)
             error_code = "live_turn_failed" if status == "failed" else None
             self.registry.update_live_request(request_id, status=status, error_code=error_code)
