@@ -107,6 +107,8 @@ The bridge is conservative by design.
 - Live completions are not accepted solely because they are the next event in a buffer.
 - Reconnects invalidate live ownership proofs.
 - Replay gaps and epoch changes fail closed into recovery rather than guessing.
+- A conservative live result that advises reconciliation leaves the request stored as reconcilable (`unknown`); ordinary bounded waits with a still-running turn keep the request retriable.
+- Hermes' transient `4007 "session no longer live; retry resume"` receives exactly one bounded `session.resume` retry during stored-session attach; a genuine `4007 "session not found"` never retries and never auto-creates a session.
 - The bridge registry stores IDs, hashes, cursors, status and routing metadata — not raw prompts or credentials.
 - MCP tools are an allowlist. Raw shell, arbitrary gateway RPC, slash commands and configuration mutation are not exposed.
 
@@ -204,7 +206,7 @@ The project uses deterministic fake transports for most protocol tests plus real
 
 Stage 2.2 is intentionally split into bounded PRs:
 
-1. **Lifecycle recovery** — close conservative wait → reconciliation gaps and handle Hermes' transient "session no longer live; retry resume" race without masking genuine missing sessions.
+1. **Lifecycle recovery** — implemented (Stage 2.2A): conservative wait results persist reconcilable state; bounded single retry for Hermes' transient "session no longer live; retry resume" race; genuine missing sessions stay fail-closed.
 2. **First-class multi-profile routing** — make profile part of durable lane identity, preserve it across restart/resume, and route durable API requests through Hermes `/p/<profile>/...` with profile-scoped credentials.
 3. **Public packaging/hardening** — client-neutral naming/docs, clean-install smoke, CI/release metadata, registry schema ownership and generic examples.
 

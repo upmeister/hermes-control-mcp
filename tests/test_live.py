@@ -71,10 +71,14 @@ class FakeGateway:
         self.epoch = "epoch-1"
         self.prompt_calls = 0
         self.replay_calls = 0
+        self.resume_calls = 0
         self.session_counter = 0
         self.mode = "normal"
         self.complete_delay: float | None = 0.15
         self.inflight_enabled = True
+        # Scripted JSON-RPC error frames consumed one per session.resume call
+        # before the success reply (deterministic transient-4007 simulation).
+        self.resume_errors: list[dict] = []
         # When set, session.events.since responses report truncated=True so the
         # client's real replay path records the degradation marker itself.
         self.truncated_replay = False
@@ -136,6 +140,10 @@ class FakeGateway:
                     },
                 })
             elif method == "session.resume":
+                self.resume_calls += 1
+                if self.resume_errors:
+                    socket.push({"jsonrpc": "2.0", "id": rid, "error": self.resume_errors.pop(0)})
+                    return
                 socket.push({
                     "jsonrpc": "2.0", "id": rid,
                     "result": {
@@ -822,10 +830,14 @@ class LiveServiceTests(unittest.TestCase):
             request_id="live-queued", queued=True, wait_seconds=1,
         )
 
-        self.assertEqual(result["status"], "queued")
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["error_code"], "ambiguous_turn")
         self.assertEqual(result["attribution"], "unproven")
         waited = service.wait(request_id="live-queued", timeout_seconds=1)
-        self.assertEqual(waited["error_code"], "ambiguous_turn")
+        # The row was persisted as unknown by the conservative wait, so a later
+        # wait replays the recovery guidance instead of re-running analysis.
+        self.assertEqual(waited["status"], "unknown")
+        self.assertEqual(waited["error_code"], "transport_unknown")
         self.assertIsNone(waited.get("answer"))
         self.assertEqual(gateway.prompt_calls, 1)
 
@@ -991,8 +1003,9 @@ class LiveServiceTests(unittest.TestCase):
         self.assertEqual(waited["error_code"], "completion_not_observed")
         self.assertIsNone(waited.get("answer"))
 
-        # The post-gap completion must still not be accepted: durable recovery
-        # (live_reconcile/live_history) is the only admissible path here.
+        # The post-gap completion must still not be accepted: the first
+        # conservative wait persisted the recovery state, so this wait replays
+        # it and points at live_reconcile/live_history.
         resumed["running"] = False
         resumed["inflight_user"] = None
         gateway.emit_event(
@@ -1003,7 +1016,7 @@ class LiveServiceTests(unittest.TestCase):
         waited = service.wait(request_id="live-gap", timeout_seconds=0.5)
 
         self.assertEqual(waited["status"], "unknown")
-        self.assertEqual(waited["error_code"], "completion_not_observed")
+        self.assertEqual(waited["error_code"], "transport_unknown")
         self.assertIsNone(waited.get("answer"))
 
     def test_failed_local_turn_completion_is_reported(self):
@@ -1165,7 +1178,9 @@ class LiveServiceTests(unittest.TestCase):
         self.assertEqual(waited["error_code"], "completion_not_observed")
         self.assertIsNone(waited.get("answer"))
 
-        # Even a completion buffered after the rotation stays unattributable.
+        # Even a completion buffered after the rotation stays unattributable;
+        # the first conservative wait persisted the recovery state, so this
+        # wait replays the reconcile guidance.
         resumed["running"] = False
         resumed["inflight_user"] = None
         gateway.emit_event(
@@ -1174,7 +1189,7 @@ class LiveServiceTests(unittest.TestCase):
         )
         waited = service.wait(request_id="live-gap-rotate", timeout_seconds=0.4)
         self.assertEqual(waited["status"], "unknown")
-        self.assertEqual(waited["error_code"], "completion_not_observed")
+        self.assertEqual(waited["error_code"], "transport_unknown")
         self.assertIsNone(waited.get("answer"))
 
     def test_concurrent_same_request_id_submits_exactly_once(self):
@@ -1295,6 +1310,124 @@ class LiveServiceTests(unittest.TestCase):
         self.assertEqual(result["status"], "unknown")
         self.assertEqual(result["error_code"], "reconcile_boundary_missing")
         self.assertEqual(result["reconciliation"], "legacy_record_without_boundary")
+
+    def test_conservative_wait_result_is_reconcilable(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, registry = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        text = "recover me"
+        service.prompt(
+            lane="coding", session_id=opened["session_id"], text=text, request_id="live-recover",
+        )
+        # Event loss makes live_wait conservative while the turn still runs.
+        gateway.truncated_replay = True
+        service.reconnect()
+        resumed = gateway.turn_state("runtime-resumed")
+        resumed["running"] = True
+        resumed["inflight_user"] = text
+
+        waited = service.wait(request_id="live-recover", timeout_seconds=0.3)
+        self.assertEqual(waited["status"], "unknown")
+        self.assertEqual(waited["error_code"], "completion_not_observed")
+
+        # The result's own recovery advice must be actionable: the row is now
+        # stored as unknown ...
+        record = registry.live_request_by_id("live-recover")
+        self.assertEqual(record["status"], "unknown")
+        self.assertEqual(record["error_code"], "completion_not_observed")
+
+        # ... so a durable post-boundary user row reconciles it end to end.
+        gateway.history_rows.append({"role": "user", "text": text, "row_id": 1})
+        gateway.history_rows.append({"role": "assistant", "text": "done", "row_id": 2})
+        result = service.reconcile(request_id="live-recover")
+        self.assertEqual(result["status"], "reconciled")
+        self.assertEqual(result["reconciliation"], "history_match_post_boundary")
+
+    def test_unproven_ambiguous_wait_is_reconcilable(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, registry = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        gateway.mode = "busy"
+        service.prompt(
+            lane="coding", session_id=opened["session_id"], text="queued text", request_id="live-queued-rec",
+        )
+        gateway.mode = "normal"
+
+        waited = service.wait(request_id="live-queued-rec", timeout_seconds=0.2)
+        self.assertEqual(waited["status"], "unknown")
+        self.assertEqual(waited["error_code"], "ambiguous_turn")
+
+        record = registry.live_request_by_id("live-queued-rec")
+        self.assertEqual(record["status"], "unknown")
+
+        gateway.history_rows.append({"role": "user", "text": "queued text", "row_id": 1})
+        result = service.reconcile(request_id="live-queued-rec")
+        self.assertEqual(result["status"], "reconciled")
+
+    def test_wait_timeout_keeps_row_retriable(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, registry = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        service.prompt(
+            lane="coding", session_id=opened["session_id"], text="still running", request_id="live-timeout-keep",
+        )
+
+        waited = service.wait(request_id="live-timeout-keep", timeout_seconds=0.2)
+
+        self.assertEqual(waited["status"], "running")
+        self.assertEqual(waited["error_code"], "wait_timeout")
+        record = registry.live_request_by_id("live-timeout-keep")
+        self.assertNotEqual(record["status"], "unknown")
+
+    def test_transient_4007_resume_is_retried_once(self):
+        gateway = FakeGateway()
+        service, registry = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        stored = opened["stored_session_id"]
+        # Reaper race: the gateway retires the live record between resume
+        # lookup and reattach; the transient 4007 semantic explicitly tells
+        # the client to retry resume.
+        gateway.resume_errors.append({"code": 4007, "message": "session no longer live; retry resume"})
+
+        reopened = service.open(lane="coding", session_id=stored)
+
+        self.assertTrue(reopened["ok"])
+        self.assertEqual(reopened["session_id"], "runtime-resumed")
+        self.assertEqual(reopened["stored_session_id"], stored)
+        self.assertEqual(gateway.resume_calls, 2)
+        self.assertEqual(registry.session_for_lane("coding"), stored)
+
+    def test_transient_4007_twice_fails_structured_after_exactly_two_resumes(self):
+        gateway = FakeGateway()
+        service, registry = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        stored = opened["stored_session_id"]
+        transient = {"code": 4007, "message": "session no longer live; retry resume"}
+        gateway.resume_errors.extend([transient, transient])
+
+        reopened = service.open(lane="coding", session_id=stored)
+
+        self.assertFalse(reopened["ok"])
+        self.assertEqual(reopened["error_code"], "rpc_4007")
+        self.assertEqual(gateway.resume_calls, 2)
+        self.assertEqual(registry.session_for_lane("coding"), stored)
+
+    def test_genuine_4007_session_not_found_is_never_retried_or_created(self):
+        gateway = FakeGateway()
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        stored = opened["stored_session_id"]
+        gateway.resume_errors.append({"code": 4007, "message": "session not found"})
+        created_before = gateway.session_counter
+
+        reopened = service.open(lane="coding", session_id=stored)
+
+        self.assertFalse(reopened["ok"])
+        self.assertEqual(gateway.resume_calls, 1)
+        self.assertEqual(gateway.session_counter, created_before)
 
     def test_legacy_registry_database_gets_attribution_columns(self):
         gateway = FakeGateway()
