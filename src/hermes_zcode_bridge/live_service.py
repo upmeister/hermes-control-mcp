@@ -207,6 +207,8 @@ class LiveService:
         for request in self.registry.live_requests_for_profile_lane(profile, lane):
             if request.get("runtime_session_id") != runtime:
                 self.registry.update_live_request(request["request_id"], runtime_session_id=runtime)
+        # Reconnect replay must address this session under the same profile.
+        self.client.set_session_profile(runtime, profile)
 
     def _lane_profile(self, lane: str, profile: str | None) -> tuple[str, dict[str, Any] | None]:
         """Resolve a lane's governing profile with fail-closed ambiguity.
@@ -796,9 +798,11 @@ class LiveService:
         """Resolve (runtime, profile, error) for a live read/control call.
 
         Lane-addressed calls infer the lane's profile with fail-closed
-        ambiguity; runtime-addressed calls infer the profile from the stored
-        binding for that runtime when omitted and use the default profile when
-        the runtime is not known locally (backward compatibility).
+        ambiguity; runtime-addressed calls resolve the profile against the
+        stored binding for that runtime — omitted infers it (fail-closed when
+        ambiguous) and a supplied different profile is a conflict, never a
+        reroute. An unknown runtime routes through the supplied profile or the
+        default profile (backward compatibility).
         """
         try:
             if lane:
@@ -810,22 +814,34 @@ class LiveService:
                 return runtime, resolved_profile, error
             if session_id:
                 runtime = _visible_id(session_id, "session_id")
+                bound = self._profiles_for_runtime(runtime)
                 if profile is not None:
-                    return runtime, _profile_input(profile), None
-                stored = self._stored_by_runtime.get(runtime)
-                if stored is None:
-                    return runtime, DEFAULT_PROFILE, None
-                bound = self.registry.profiles_for_session(stored)
+                    canonical = _profile_input(profile)
+                    if bound and canonical not in bound:
+                        return None, DEFAULT_PROFILE, self._result(
+                            status="failed", error_code="request_profile_conflict",
+                            error=(f"This live session belongs to profile(s) {bound}; "
+                                   f"refusing to route it through profile {canonical!r}"),
+                        )
+                    return runtime, canonical, None
                 if len(bound) > 1:
                     return None, DEFAULT_PROFILE, self._result(
                         status="failed", error_code="lane_profile_ambiguous",
-                        error=(f"This stored session is bound under multiple profiles {bound}; "
+                        error=(f"This live session is bound under multiple profiles {bound}; "
                                "supply an explicit profile"),
                     )
                 return runtime, (bound[0] if bound else DEFAULT_PROFILE), None
             raise InputError("lane or session_id is required")
         except (InputError, TypeError, ValueError) as exc:
             return None, DEFAULT_PROFILE, self._input_error(exc)
+
+    def _profiles_for_runtime(self, runtime: str) -> list[str]:
+        """Locally bound profiles for one runtime id (bindings + request rows)."""
+        stored = self._stored_by_runtime.get(runtime)
+        profiles: set[str] = set(self.registry.live_request_profiles_for_runtime(runtime))
+        if stored:
+            profiles.update(self.registry.profiles_for_session(stored))
+        return sorted(profiles)
 
     def events(self, *, lane: str | None = None, session_id: str | None = None, after_seq: int = 0,
                profile: str | None = None) -> dict[str, Any]:

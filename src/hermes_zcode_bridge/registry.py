@@ -469,6 +469,16 @@ class StateRegistry:
             ).fetchall()
         return [str(row[0]) for row in rows]
 
+    def live_request_profiles_for_runtime(self, runtime_session_id: str) -> list[str]:
+        """Distinct profiles among live request rows for one runtime id, sorted."""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT DISTINCT COALESCE(profile,'default') AS p FROM live_requests
+                   WHERE runtime_session_id=? ORDER BY p""",
+                (runtime_session_id,),
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
     def live_requests_for_profile_lane(self, profile: str, lane: str) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(

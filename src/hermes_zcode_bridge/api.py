@@ -35,10 +35,11 @@ class APIError(RuntimeError):
         return self.message
 
 
-def _redact(text: str, secret: str | None = None) -> str:
+def _redact(text: str, *secrets: str | None) -> str:
     safe = str(text or "")
-    if secret:
-        safe = safe.replace(secret, "[REDACTED]")
+    for secret in secrets:
+        if secret:
+            safe = safe.replace(secret, "[REDACTED]")
     safe = re.sub(r"(?i)(bearer\s+)[^\s,;]+", r"\1[REDACTED]", safe)
     safe = re.sub(r"(?i)((?:api[_-]?key|token|secret|password)\s*[=:]\s*)[^\s,;]+", r"\1[REDACTED]", safe)
     return safe[:2000]
@@ -66,6 +67,10 @@ class HermesAPIClient:
     def __init__(self, config: BridgeConfig, *, transport: Callable[..., APIResponse] | None = None):
         self.config = config
         self._api_key = config.resolved_api_key()
+        # Every key this client can ever send is tracked for error redaction:
+        # an upstream error message may embed any configured key, not only the
+        # key used by the current request. Key values are never logged.
+        self._known_keys: set[str] = {self._api_key} if self._api_key else set()
         self._transport = transport
 
     def _endpoint(self, profile: str | None) -> tuple[str, str]:
@@ -94,6 +99,7 @@ class HermesAPIClient:
                 f"Named profile {profile!r} has no usable API_SERVER_KEY in its profile .env; "
                 "the default profile key is never inherited for named profiles",
             )
+        self._known_keys.add(key)
         return f"{parts.scheme}://{parts.netloc}/p/{profile}", key
 
     def _url(self, path: str, base: str) -> str:
@@ -173,7 +179,7 @@ class HermesAPIClient:
             raise APIError(
                 response.status,
                 code,
-                _redact(message, key),
+                _redact(message, *self._known_keys),
                 retryable=response.status in {408, 409, 425, 429} or response.status >= 500,
             )
         if raw:

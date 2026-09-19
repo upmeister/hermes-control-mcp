@@ -335,6 +335,35 @@ class DurableProfileRoutingTests(unittest.TestCase):
         self.assertEqual(ok["profile"], "coder")
         self.assertEqual(calls, ["/p/coder/v1/runs", "/p/coder/v1/runs/run-1"])
 
+    def test_ambiguous_local_session_rejects_unrelated_supplied_profile(self):
+        def handler(method, url, headers, body, timeout):
+            return response(200, {"data": [], "pagination": {}})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = BridgeConfig(
+                api_url="http://bridge.test:8642", api_key=DEFAULT_KEY,
+                state_db=Path(tmp) / "state.db", request_timeout=3,
+                profiles_root=_make_profiles_root(tmp, {"coder": NAMED_KEY, "ghost": "ghost-key-canary-0002"}),
+            )
+            transport = FakeTransport(handler)
+            registry = StateRegistry(config.state_db)
+            self.addCleanup(registry.close)
+            service = BridgeService(HermesAPIClient(config, transport=transport), registry)
+            registry.bind_profile_lane("default", "work", "stored-both")
+            registry.bind_profile_lane("coder", "work", "stored-both")
+
+            # An exact ID ambiguous across local profiles fails closed when the
+            # supplied profile matches neither binding.
+            unrelated = service.history(session_id="stored-both", profile="ghost")
+            self.assertFalse(unrelated["ok"])
+            self.assertEqual(unrelated["error_code"], "request_profile_conflict")
+            self.assertEqual(transport.calls, [])
+
+            # A supplied profile that matches one binding resolves the ambiguity.
+            resolved = service.history(session_id="stored-both", profile="coder")
+            self.assertTrue(resolved["ok"])
+            self.assertEqual(urlparse(transport.calls[-1]["url"]).path, "/p/coder/api/sessions/stored-both/messages")
+
     def test_lane_lookup_ambiguity_fails_closed_but_explicit_profile_resolves(self):
         def handler(method, url, headers, body, timeout):
             return response(202, {"run_id": f"run-{len(urlparse(url).path)}", "status": "started", "replayed": False})
@@ -527,6 +556,38 @@ class LiveProfileTests(unittest.TestCase):
         self.assertEqual(service.wait(lane="work", timeout_seconds=0.0)["error_code"], "lane_profile_ambiguous")
         self.assertEqual(service.wait(lane="work", timeout_seconds=0.0, profile="coder")["profile"], "coder")
 
+    def test_known_runtime_with_conflicting_profile_fails_closed(self):
+        service, _, gateway = self.make_service()
+        opened = service.open(lane="repo", profile="coder")
+        self.assertTrue(opened["ok"])
+        frames_before = len(self.all_frames(gateway))
+
+        conflict = service.status(session_id=opened["session_id"], profile="default")
+        self.assertFalse(conflict["ok"])
+        self.assertEqual(conflict["error_code"], "request_profile_conflict")
+        history_conflict = service.history(session_id=opened["session_id"], profile="default")
+        self.assertFalse(history_conflict["ok"])
+        self.assertEqual(history_conflict["error_code"], "request_profile_conflict")
+        # No gateway read was issued under the wrong profile.
+        self.assertEqual(len(self.all_frames(gateway)), frames_before)
+
+        # The omitted profile infers the stored binding instead.
+        inferred = service.status(session_id=opened["session_id"])
+        self.assertTrue(inferred["ok"])
+        self.assertEqual(inferred["profile"], "coder")
+
+    def test_reconnect_replay_carries_the_stored_profile(self):
+        service, _, gateway = self.make_service()
+        self.assertTrue(service.open(lane="repo", profile="coder")["ok"])
+        prompted = service.prompt(lane="repo", text="replay me", wait_seconds=0)
+        self.assertTrue(prompted["ok"])
+
+        reconnected = service.reconnect()
+        self.assertTrue(reconnected["ok"])
+        replays = [f for f in self.all_frames(gateway) if f["method"] == "session.events.since"]
+        self.assertTrue(replays)
+        self.assertTrue(all(f["params"]["profile"] == "coder" for f in replays), msg=replays)
+
 
 class ProfileSecretBoundaryTests(unittest.TestCase):
     def test_registry_stores_profile_names_but_never_keys(self):
@@ -554,6 +615,12 @@ class ProfileSecretBoundaryTests(unittest.TestCase):
         def leaking_handler(method, url, headers, body, timeout):
             return response(500, {"error": {"code": "boom", "message": f"auth failed near {NAMED_KEY}"}})
 
+        def default_key_leaking_handler(method, url, headers, body, timeout):
+            # A named-profile request whose error message embeds the DEFAULT
+            # key: redaction must cover every key the client knows, not only
+            # the key used by the current request.
+            return response(500, {"error": {"code": "boom", "message": f"auth failed near {DEFAULT_KEY}"}})
+
         with tempfile.TemporaryDirectory() as tmp:
             config = BridgeConfig(
                 api_url="http://bridge.test:8642", api_key=DEFAULT_KEY,
@@ -569,6 +636,13 @@ class ProfileSecretBoundaryTests(unittest.TestCase):
             self.assertIn("[REDACTED]", result["error"])
             self.assertNotIn(NAMED_KEY, json.dumps(result))
             self.assertNotIn(DEFAULT_KEY, json.dumps(result))
+
+            client2 = HermesAPIClient(config, transport=FakeTransport(default_key_leaking_handler))
+            service2 = BridgeService(client2, registry)
+            result2 = service2.start(lane="lane-b", prompt="inspect", request_id="req-2", profile="coder")
+            self.assertFalse(result2["ok"])
+            self.assertIn("[REDACTED]", result2["error"])
+            self.assertNotIn(DEFAULT_KEY, json.dumps(result2))
 
     def test_mcp_tool_descriptions_carry_no_secret_values(self):
         serialized = json.dumps(_TOOL_DESCRIPTIONS)

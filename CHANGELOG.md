@@ -27,7 +27,13 @@ All notable user-facing changes to this local bridge are documented here.
   canonical `profile` where it identifies the target. New structured errors:
   `invalid_profile`, `lane_profile_ambiguous`, `lane_profile_conflict`,
   `request_profile_conflict`, `profile_key_unavailable`,
-  `profile_route_config_error`.
+  `profile_route_config_error`. Reconnect replay (`session.events.since`)
+  addresses each buffered session under its remembered profile. API error
+  redaction covers every key the client knows (the default key and any
+  resolved named-profile key), not only the key used by the current request.
+  A runtime-addressed live call whose supplied profile disagrees with the
+  stored binding fails closed with `request_profile_conflict` instead of
+  routing through the wrong profile.
 
 ### Fixed
 

@@ -200,6 +200,11 @@ class LiveGatewayClient:
         self._event_evicted_through: dict[str, int] = {}
         self._event_total_bytes = 0
         self._watermarks: dict[str, int] = {}
+        # Routing identity per buffered session, remembered by the live
+        # service when it binds a runtime. Reconnect replay must address each
+        # session under its stored profile (SessionEventsSinceParams.profile);
+        # a session with no remembered profile replays as the default profile.
+        self._session_profiles: dict[str, str] = {}
         self._events_condition = threading.Condition(self._state_lock)
 
     # ----- lifecycle -----------------------------------------------------
@@ -742,7 +747,13 @@ class LiveGatewayClient:
             self._event_bytes.pop(sid, None)
         self._watermarks.pop(sid, None)
         self._event_evicted_through.pop(sid, None)
+        self._session_profiles.pop(sid, None)
         self._replay_gap_allowed.discard(sid)
+
+    def set_session_profile(self, session_id: str, profile: str) -> None:
+        """Remember the routing profile for one buffered session's replay."""
+        with self._state_lock:
+            self._session_profiles[session_id] = profile
 
     def _ensure_session_slot(self, sid: str) -> bool:
         if sid in self._watermarks:
@@ -897,8 +908,11 @@ class LiveGatewayClient:
             valid = False
             result: Any = None
             try:
+                with self._state_lock:
+                    replay_profile = self._session_profiles.get(sid, "default")
                 result = await self._call_async(
-                    "session.events.since", {"session_id": sid, "last_seen": last_seen},
+                    "session.events.since",
+                    {"session_id": sid, "last_seen": last_seen, "profile": replay_profile},
                     timeout=min(10.0, self.config.gateway_request_timeout),
                 )
                 parked = list(self._replay_hold.get(sid, [])) if self._replay_hold is not None else []
