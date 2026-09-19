@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import socket
+import sqlite3
 import tempfile
 import threading
 import time
@@ -56,6 +57,13 @@ class FakeSocket:
 
 
 class FakeGateway:
+    """Scripted stand-in for the deployed TUI gateway's client-visible contract.
+
+    Models the source-verified session state the bridge relies on: a running
+    flag, the inflight turn's stripped user text (exposed by session.activate),
+    per-session event sequence numbers, and durable history rows with row_id.
+    """
+
     def __init__(self):
         self.sockets: list[FakeSocket] = []
         self.connect_kwargs: list[dict] = []
@@ -65,6 +73,48 @@ class FakeGateway:
         self.replay_calls = 0
         self.session_counter = 0
         self.mode = "normal"
+        self.complete_delay: float | None = 0.15
+        self.inflight_enabled = True
+        # When set, session.events.since responses report truncated=True so the
+        # client's real replay path records the degradation marker itself.
+        self.truncated_replay = False
+        # When set, these retained events are replayed verbatim by
+        # session.events.since on the next (re)connect.
+        self.replay_events: list[dict] = []
+        self.history_rows: list[dict] = []
+        self.turns: dict[str, dict] = {}
+
+    def turn_state(self, session_id: str) -> dict:
+        return self.turns.setdefault(
+            session_id, {"running": False, "inflight_user": None, "seq": 0, "inflight_error": False})
+
+    def emit_event(self, socket: FakeSocket, session_id: str, kind: str, payload: dict | None = None) -> int:
+        state = self.turn_state(session_id)
+        state["seq"] += 1
+        params: dict = {"type": kind, "session_id": session_id, "seq": state["seq"]}
+        if payload is not None:
+            params["payload"] = payload
+        socket.push({"jsonrpc": "2.0", "method": "event", "params": params})
+        return state["seq"]
+
+    def inject_foreign_turn(self, socket: FakeSocket, session_id: str, text: str = "foreign-answer") -> None:
+        self.emit_event(socket, session_id, "message.start")
+        self.emit_event(socket, session_id, "message.complete", {"status": "complete", "text": text})
+
+    def _complete_turn(self, socket: FakeSocket, session_id: str) -> None:
+        # Source-faithful deployed ordering (prompt_turn._complete_turn_payload
+        # -> _run_after_agent_ready): the gateway clears the inflight snapshot
+        # BEFORE emitting message.complete and clears running=False later, so a
+        # completion poll can legitimately observe running=true, inflight=None.
+        state = self.turn_state(session_id)
+        state["inflight_user"] = None
+        state["inflight_error"] = False
+        self.history_rows.append({"role": "assistant", "text": "done", "row_id": len(self.history_rows) + 1})
+        self.emit_event(socket, session_id, "message.complete", {"status": "complete", "text": "done"})
+        asyncio.get_running_loop().call_later(0.05, self._end_turn, session_id)
+
+    def _end_turn(self, session_id: str) -> None:
+        self.turn_state(session_id)["running"] = False
 
     async def connect(self, url: str, **kwargs):
         self.connect_urls.append(url)
@@ -96,15 +146,28 @@ class FakeGateway:
                     },
                 })
             elif method == "session.activate":
-                socket.push({
-                    "jsonrpc": "2.0", "id": rid,
-                    "result": {
-                        "session_id": frame["params"]["session_id"],
-                        "stored_session_id": "stored-1",
-                        "message_count": 0,
-                        "messages": [],
-                    },
-                })
+                result = {
+                    "session_id": frame["params"]["session_id"],
+                    "stored_session_id": "stored-1",
+                    "message_count": 0,
+                    "messages": [],
+                }
+                if self.inflight_enabled:
+                    state = self.turn_state(frame["params"]["session_id"])
+                    result["running"] = state["running"]
+                    # Faithful to gateway _inflight_snapshot: the snapshot exists
+                    # only while a prompted turn is in flight; once the gateway
+                    # clears it (before emitting message.complete) the activate
+                    # payload omits "inflight" entirely.
+                    if state["inflight_user"] is not None:
+                        inflight = {
+                            "user": state["inflight_user"], "assistant": "", "streaming": True,
+                        }
+                        if state.get("inflight_error"):
+                            inflight["error"] = "retained turn failure"
+                            inflight["status"] = "error"
+                        result["inflight"] = inflight
+                socket.push({"jsonrpc": "2.0", "id": rid, "result": result})
             elif method == "session.events.since":
                 self.replay_calls += 1
                 if self.mode == "race":
@@ -127,31 +190,37 @@ class FakeGateway:
                         },
                     })
                 else:
+                    replayed_events = list(self.replay_events)
+                    latest = max([e["seq"] for e in replayed_events], default=1)
                     socket.push({
                         "jsonrpc": "2.0", "id": rid,
-                        "result": {"session_id": frame["params"]["session_id"], "events": [],
-                                   "latest_seq": 1, "truncated": False, "epoch": self.epoch,
-                                   "count": 0, "open_requests": []},
+                        "result": {"session_id": frame["params"]["session_id"], "events": replayed_events,
+                                   "latest_seq": latest, "truncated": self.truncated_replay,
+                                   "epoch": self.epoch, "count": len(replayed_events),
+                                   "open_requests": []},
                     })
             elif method == "prompt.submit":
                 self.prompt_calls += 1
                 if self.mode == "unknown":
                     await socket.close()
                     return
+                if self.mode == "busy":
+                    socket.push({"jsonrpc": "2.0", "id": rid, "result": {"status": "queued"}})
+                    return
+                session_id = frame["params"]["session_id"]
+                state = self.turn_state(session_id)
+                state["running"] = True
+                state["inflight_user"] = frame["params"]["text"]
                 socket.push({"jsonrpc": "2.0", "id": rid, "result": {"status": "streaming"}})
-                socket.push({
-                    "jsonrpc": "2.0", "method": "event",
-                    "params": {"type": "message.start", "session_id": frame["params"]["session_id"], "seq": 1},
-                })
-                socket.push({
-                    "jsonrpc": "2.0", "method": "event",
-                    "params": {"type": "message.complete", "session_id": frame["params"]["session_id"], "seq": 2,
-                               "payload": {"status": "complete", "text": "done"}},
-                })
+                self.emit_event(socket, session_id, "message.start")
+                if self.complete_delay is not None:
+                    asyncio.get_running_loop().call_later(
+                        self.complete_delay, self._complete_turn, socket, session_id)
             elif method == "session.status":
                 socket.push({"jsonrpc": "2.0", "id": rid, "result": {"output": "Hermes TUI Status"}})
             elif method == "session.history":
-                socket.push({"jsonrpc": "2.0", "id": rid, "result": {"messages": []}})
+                messages = [dict(row) for row in self.history_rows]
+                socket.push({"jsonrpc": "2.0", "id": rid, "result": {"count": len(messages), "messages": messages}})
             elif method == "session.steer":
                 socket.push({"jsonrpc": "2.0", "id": rid, "result": {"status": "queued"}})
             elif method == "session.interrupt":
@@ -702,6 +771,577 @@ class LiveServiceTests(unittest.TestCase):
         )
         self.assertTrue(second["replayed"])
         self.assertEqual(gateway.prompt_calls, 1)
+
+    # ----- H1: shared-turn completion attribution --------------------------
+
+    def test_foreign_completion_between_submit_and_local_turn_is_rejected(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = 0.5
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        socket = gateway.sockets[0]
+        runtime = opened["session_id"]
+
+        timer = threading.Timer(0.2, lambda: gateway.inject_foreign_turn(socket, runtime, "foreign-answer"))
+        timer.start()
+        self.addCleanup(timer.join, 1.0)
+
+        result = service.prompt(
+            lane="coding", session_id=runtime, text="local question", request_id="live-foreign", wait_seconds=2,
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["answer"], "done")
+        self.assertNotEqual(result.get("answer"), "foreign-answer")
+
+    def test_foreign_completion_alone_never_satisfies_local_wait(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        runtime = opened["session_id"]
+        service.prompt(
+            lane="coding", session_id=runtime, text="local question", request_id="live-foreign-only",
+        )
+        gateway.inject_foreign_turn(gateway.sockets[0], runtime, "foreign-answer")
+
+        waited = service.wait(request_id="live-foreign-only", timeout_seconds=0.5)
+
+        self.assertEqual(waited["status"], "running")
+        self.assertEqual(waited["error_code"], "wait_timeout")
+        self.assertIsNone(waited.get("answer"))
+
+    def test_queued_submit_wait_is_conservative(self):
+        gateway = FakeGateway()
+        gateway.mode = "busy"
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+
+        result = service.prompt(
+            lane="coding", session_id=opened["session_id"], text="queued question",
+            request_id="live-queued", queued=True, wait_seconds=1,
+        )
+
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(result["attribution"], "unproven")
+        waited = service.wait(request_id="live-queued", timeout_seconds=1)
+        self.assertEqual(waited["error_code"], "ambiguous_turn")
+        self.assertIsNone(waited.get("answer"))
+        self.assertEqual(gateway.prompt_calls, 1)
+
+    def test_unprovable_claim_keeps_wait_conservative_even_with_buffered_completion(self):
+        gateway = FakeGateway()
+        gateway.inflight_enabled = False
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+
+        result = service.prompt(
+            lane="coding", session_id=opened["session_id"], text="no proof",
+            request_id="live-noproof",
+        )
+
+        self.assertEqual(result["status"], "streaming")
+        self.assertEqual(result["attribution"], "unproven")
+        waited = service.wait(request_id="live-noproof", timeout_seconds=0.5)
+        self.assertEqual(waited["error_code"], "ambiguous_turn")
+        self.assertIsNone(waited.get("answer"))
+
+    def test_wait_after_rotation_reports_completion_not_observed(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        service.prompt(
+            lane="coding", session_id=opened["session_id"], text="lost turn", request_id="live-rotate-wait",
+        )
+        gateway.epoch = "epoch-2"
+
+        service.reconnect()
+        waited = service.wait(request_id="live-rotate-wait", timeout_seconds=0.5)
+
+        self.assertEqual(waited["status"], "unknown")
+        self.assertEqual(waited["error_code"], "completion_not_observed")
+        self.assertIsNone(waited.get("answer"))
+
+    def test_wait_after_epoch_rotation_is_conservative_despite_successful_reproof(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        text = "still running"
+        service.prompt(
+            lane="coding", session_id=opened["session_id"], text=text, request_id="live-rotate-running",
+        )
+        gateway.epoch = "epoch-2"
+
+        # An epoch rotation clears the buffered stream, so events emitted
+        # before the rotation may be gone: the same loss window as a truncated
+        # replay. A fresh inflight proof of the still-running turn re-anchors
+        # the cursor but cannot restore ordering evidence, so the wait stays
+        # conservative and routes to durable recovery.
+        service.reconnect()
+        resumed_state = gateway.turn_state("runtime-resumed")
+        resumed_state["running"] = True
+        resumed_state["inflight_user"] = text
+
+        waited = service.wait(request_id="live-rotate-running", timeout_seconds=0.4)
+
+        self.assertEqual(waited["status"], "unknown")
+        self.assertEqual(waited["error_code"], "completion_not_observed")
+        self.assertIsNone(waited.get("answer"))
+
+    def test_wait_after_same_epoch_reconnect_reproves_and_completes(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        text = "survives a reconnect"
+        service.prompt(
+            lane="coding", session_id=opened["session_id"], text=text, request_id="live-reconnect-ok",
+        )
+
+        # Plain reconnect: same replay epoch, new connection generation, so the
+        # proof watermark continuity is gone and a fresh inflight proof is
+        # required before any completion may be accepted.
+        service.reconnect()
+        resumed_state = gateway.turn_state("runtime-resumed")
+        resumed_state["running"] = True
+        resumed_state["inflight_user"] = text
+        waited = service.wait(request_id="live-reconnect-ok", timeout_seconds=0.3)
+        self.assertEqual(waited["status"], "running")
+
+        gateway.turn_state("runtime-resumed")["inflight_user"] = None
+        gateway.emit_event(
+            gateway.sockets[-1], "runtime-resumed", "message.complete",
+            {"status": "complete", "text": "done"},
+        )
+        gateway.turn_state("runtime-resumed")["running"] = False
+        waited = service.wait(request_id="live-reconnect-ok", timeout_seconds=1)
+
+        self.assertEqual(waited["status"], "completed")
+        self.assertEqual(waited["answer"], "done")
+
+    def test_identical_text_foreign_completion_is_never_returned_while_claim_runs(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        runtime = opened["session_id"]
+        service.prompt(
+            lane="coding", session_id=runtime, text="same text", request_id="live-same-text",
+        )
+        # A foreign turn with a byte-identical prompt produces an inflight
+        # snapshot and completion payload indistinguishable from ours; under a
+        # claimed run it must still never satisfy the local wait.
+        gateway.inject_foreign_turn(gateway.sockets[0], runtime, "done")
+
+        waited = service.wait(request_id="live-same-text", timeout_seconds=0.5)
+
+        self.assertEqual(waited["status"], "running")
+        self.assertEqual(waited["error_code"], "wait_timeout")
+        self.assertIsNone(waited.get("answer"))
+
+    def test_foreign_replacement_with_different_prompt_is_conservative(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        runtime = opened["session_id"]
+        service.prompt(
+            lane="coding", session_id=runtime, text="local question", request_id="live-replaced",
+        )
+        # A foreign turn with a DIFFERENT prompt replaces ours in the gateway
+        # state while a completion is already buffered; a conforming gateway
+        # never emits a turn's completion while its inflight snapshot is still
+        # live, so this ordering cannot attribute the candidate.
+        replaced = gateway.turn_state(runtime)
+        replaced["inflight_user"] = "foreign different prompt"
+        replaced["running"] = True
+        gateway.inject_foreign_turn(gateway.sockets[0], runtime, "foreign-answer")
+
+        waited = service.wait(request_id="live-replaced", timeout_seconds=0.5)
+
+        self.assertEqual(waited["status"], "unknown")
+        self.assertEqual(waited["error_code"], "completion_not_observed")
+        self.assertIsNone(waited.get("answer"))
+
+    def test_wait_after_truncated_replay_is_conservative(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        text = "gap survivor"
+        service.prompt(
+            lane="coding", session_id=opened["session_id"], text=text, request_id="live-gap",
+        )
+
+        # Same-epoch reconnect while the claimed turn still runs: the fresh
+        # inflight proof succeeds, but the gateway reports the replay for this
+        # connection as truncated (real session.events.since response path), so
+        # buffered ordering can no longer attribute any completion, even one
+        # arriving after the re-proof.
+        gateway.truncated_replay = True
+        service.reconnect()
+        resumed = gateway.turn_state("runtime-resumed")
+        resumed["running"] = True
+        resumed["inflight_user"] = text
+
+        waited = service.wait(request_id="live-gap", timeout_seconds=0.3)
+        self.assertEqual(waited["status"], "unknown")
+        self.assertEqual(waited["error_code"], "completion_not_observed")
+        self.assertIsNone(waited.get("answer"))
+
+        # The post-gap completion must still not be accepted: durable recovery
+        # (live_reconcile/live_history) is the only admissible path here.
+        resumed["running"] = False
+        resumed["inflight_user"] = None
+        gateway.emit_event(
+            gateway.sockets[-1], "runtime-resumed", "message.complete",
+            {"status": "complete", "text": "after-gap"},
+        )
+
+        waited = service.wait(request_id="live-gap", timeout_seconds=0.5)
+
+        self.assertEqual(waited["status"], "unknown")
+        self.assertEqual(waited["error_code"], "completion_not_observed")
+        self.assertIsNone(waited.get("answer"))
+
+    def test_failed_local_turn_completion_is_reported(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        runtime = opened["session_id"]
+        service.prompt(
+            lane="coding", session_id=runtime, text="failing turn", request_id="live-fail",
+        )
+        # The deployed gateway RETAINS a failed turn's inflight snapshot (with
+        # the error marker) while emitting the terminal completion.
+        failed = gateway.turn_state(runtime)
+        failed["inflight_error"] = True
+        gateway.emit_event(gateway.sockets[0], runtime, "message.complete",
+                           {"status": "error", "text": "", "error": "provider boom"})
+
+        waited = service.wait(request_id="live-fail", timeout_seconds=1)
+
+        self.assertEqual(waited["status"], "failed")
+        self.assertEqual(waited["error_code"], "live_turn_failed")
+        self.assertFalse(waited.get("answer"))
+
+    def test_success_payload_during_retained_failure_is_conservative(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        runtime = opened["session_id"]
+        service.prompt(
+            lane="coding", session_id=runtime, text="failing turn", request_id="live-fail-inject",
+        )
+        # Non-conforming ordering: a retained failed-turn snapshot followed by
+        # a SUCCESS completion must never be attributed to the local request.
+        failed = gateway.turn_state(runtime)
+        failed["inflight_error"] = True
+        gateway.emit_event(gateway.sockets[0], runtime, "message.complete",
+                           {"status": "complete", "text": "foreign-success"})
+
+        waited = service.wait(request_id="live-fail-inject", timeout_seconds=0.5)
+
+        self.assertEqual(waited["status"], "unknown")
+        self.assertEqual(waited["error_code"], "completion_not_observed")
+        self.assertIsNone(waited.get("answer"))
+
+    def test_failed_turn_error_text_is_not_returned_as_answer(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        runtime = opened["session_id"]
+        service.prompt(
+            lane="coding", session_id=runtime, text="failing turn", request_id="live-fail-text",
+        )
+        # The deployed gateway's terminal error payload carries fallback
+        # failure copy in `text` (prompt_turn._complete_turn_payload sets
+        # payload["error"] = str(error_value or raw) alongside it): that text
+        # is failure detail, never the turn's answer.
+        failed = gateway.turn_state(runtime)
+        failed["inflight_error"] = True
+        gateway.emit_event(gateway.sockets[0], runtime, "message.complete",
+                           {"status": "error", "text": "gateway failure explanation",
+                            "error": "provider boom"})
+
+        waited = service.wait(request_id="live-fail-text", timeout_seconds=1)
+
+        self.assertEqual(waited["status"], "failed")
+        self.assertEqual(waited["error_code"], "live_turn_failed")
+        self.assertEqual(waited.get("error"), "provider boom")
+        self.assertIsNone(waited.get("answer"))
+
+    def test_reconnect_during_wait_is_conservative(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        runtime = opened["session_id"]
+        service.prompt(
+            lane="coding", session_id=runtime, text="overlap probe", request_id="live-overlap",
+        )
+        # Deterministic scheduling probe: the claimed turn ends while the wait
+        # is blocked, a foreign completion is retained by the gateway, and
+        # live_reconnect overlaps the wait — the replayed candidate arrives on
+        # a NEW connection generation, so the stale proof must not admit it.
+        gateway.replay_events = [{
+            "type": "message.complete", "session_id": runtime, "seq": 2,
+            "payload": {"status": "complete", "text": "foreign-after-reconnect"},
+        }]
+        ended = gateway.turn_state(runtime)
+        ended["running"] = False
+        ended["inflight_user"] = None
+
+        real_next = service.client.next_completion
+
+        def reconnect_during_wait(session_id, *, after_seq, timeout):
+            service.reconnect()
+            return real_next(session_id, after_seq=after_seq, timeout=timeout)
+
+        service.client.next_completion = reconnect_during_wait
+
+        waited = service.wait(request_id="live-overlap", timeout_seconds=1.0)
+
+        self.assertEqual(waited["status"], "unknown")
+        self.assertEqual(waited["error_code"], "completion_not_observed")
+        self.assertIsNone(waited.get("answer"))
+
+    def test_reconnect_during_wait_without_candidate_is_conservative(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        runtime = opened["session_id"]
+        service.prompt(
+            lane="coding", session_id=runtime, text="overlap timeout", request_id="live-overlap-timeout",
+        )
+        # Deterministic scheduling probe with NO candidate: live_reconnect
+        # overlaps the wait, nothing is retained, and the blocking read times
+        # out on the new connection generation. The stale proof must not
+        # report the request as still running either.
+        real_next = service.client.next_completion
+
+        def reconnect_during_wait(session_id, *, after_seq, timeout):
+            service.reconnect()
+            return real_next(session_id, after_seq=after_seq, timeout=timeout)
+
+        service.client.next_completion = reconnect_during_wait
+
+        waited = service.wait(request_id="live-overlap-timeout", timeout_seconds=0.3)
+
+        self.assertEqual(waited["status"], "unknown")
+        self.assertEqual(waited["error_code"], "completion_not_observed")
+        self.assertIsNone(waited.get("answer"))
+
+    def test_replay_degradation_survives_runtime_rotation(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        text = "rotation survivor"
+        service.prompt(
+            lane="coding", session_id=opened["session_id"], text=text, request_id="live-gap-rotate",
+        )
+
+        # Same-epoch reconnect while the claimed turn still runs; the gateway
+        # reports the replay for the OLD runtime id as truncated (real
+        # session.events.since response path). The resume remaps the request
+        # onto a new runtime id, and the degradation marker must survive that
+        # rotation instead of being keyed away — otherwise a post-gap
+        # completion could be accepted after a successful re-proof.
+        gateway.truncated_replay = True
+        service.reconnect()
+        resumed = gateway.turn_state("runtime-resumed")
+        resumed["running"] = True
+        resumed["inflight_user"] = text
+
+        waited = service.wait(request_id="live-gap-rotate", timeout_seconds=0.4)
+        self.assertEqual(waited["status"], "unknown")
+        self.assertEqual(waited["error_code"], "completion_not_observed")
+        self.assertIsNone(waited.get("answer"))
+
+        # Even a completion buffered after the rotation stays unattributable.
+        resumed["running"] = False
+        resumed["inflight_user"] = None
+        gateway.emit_event(
+            gateway.sockets[-1], "runtime-resumed", "message.complete",
+            {"status": "complete", "text": "after-rotation"},
+        )
+        waited = service.wait(request_id="live-gap-rotate", timeout_seconds=0.4)
+        self.assertEqual(waited["status"], "unknown")
+        self.assertEqual(waited["error_code"], "completion_not_observed")
+        self.assertIsNone(waited.get("answer"))
+
+    def test_concurrent_same_request_id_submits_exactly_once(self):
+        gateway = FakeGateway()
+        service, registry = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        runtime = opened["session_id"]
+        barrier = threading.Barrier(2)
+        results: dict[str, dict] = {}
+
+        def submit(tag: str) -> None:
+            barrier.wait(timeout=2)
+            results[tag] = service.prompt(
+                lane="coding", session_id=runtime, text="only once",
+                request_id="live-race", wait_seconds=1.5,
+            )
+
+        threads = [threading.Thread(target=submit, args=(tag,)) for tag in ("a", "b")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertEqual(gateway.prompt_calls, 1)
+        self.assertEqual(len(results), 2)
+        statuses = {result["status"] for result in results.values()}
+        self.assertTrue(statuses <= {"completed", "streaming", "pending"}, statuses)
+        self.assertTrue("completed" in statuses)
+        replayed_flags = [bool(result.get("replayed")) for result in results.values()]
+        self.assertEqual(sorted(replayed_flags), [False, True])
+
+    # ----- H2: boundary-aware unknown-submit reconciliation -----------------
+
+    def test_reconcile_ignores_older_identical_prompt(self):
+        gateway = FakeGateway()
+        gateway.history_rows = [{"role": "user", "text": "same text", "row_id": 1}]
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        gateway.mode = "unknown"
+        submitted = service.prompt(
+            lane="coding", session_id=opened["session_id"], text="same text", request_id="live-old",
+        )
+        self.assertEqual(submitted["status"], "unknown")
+        gateway.mode = "normal"
+
+        result = service.reconcile(request_id="live-old")
+
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["reconciliation"], "not_observed")
+
+    def test_reconcile_matches_post_boundary_prompt(self):
+        gateway = FakeGateway()
+        gateway.history_rows = [{"role": "user", "text": "old unrelated", "row_id": 1}]
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        gateway.mode = "unknown"
+        service.prompt(
+            lane="coding", session_id=opened["session_id"], text="retry text", request_id="live-new",
+        )
+        gateway.mode = "normal"
+        gateway.history_rows.append({"role": "user", "text": "retry text", "row_id": 2})
+
+        result = service.reconcile(request_id="live-new")
+
+        self.assertEqual(result["status"], "reconciled")
+        self.assertEqual(result["reconciliation"], "history_match_post_boundary")
+
+    def test_reconcile_identical_prompts_across_boundary_count_only_post_boundary(self):
+        gateway = FakeGateway()
+        gateway.history_rows = [{"role": "user", "text": "same text", "row_id": 1}]
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        gateway.mode = "unknown"
+        service.prompt(
+            lane="coding", session_id=opened["session_id"], text="same text", request_id="live-across",
+        )
+        gateway.mode = "normal"
+        gateway.history_rows.append({"role": "user", "text": "same text", "row_id": 2})
+
+        result = service.reconcile(request_id="live-across")
+
+        self.assertEqual(result["status"], "reconciled")
+        self.assertEqual(result["reconciliation"], "history_match_post_boundary")
+
+    def test_reconcile_multiple_post_boundary_identical_prompts_stay_conservative(self):
+        gateway = FakeGateway()
+        gateway.history_rows = [{"role": "user", "text": "seed", "row_id": 1}]
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        gateway.mode = "unknown"
+        service.prompt(
+            lane="coding", session_id=opened["session_id"], text="dup", request_id="live-dup",
+        )
+        gateway.mode = "normal"
+        gateway.history_rows.extend([
+            {"role": "user", "text": "dup", "row_id": 2},
+            {"role": "user", "text": "dup", "row_id": 3},
+        ])
+
+        result = service.reconcile(request_id="live-dup")
+
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["error_code"], "ambiguous_history_match")
+        self.assertEqual(result["reconciliation"], "post_boundary_ambiguous")
+
+    def test_reconcile_without_boundary_metadata_is_conservative(self):
+        gateway = FakeGateway()
+        service, registry = self.make_service(gateway)
+        service.open(lane="coding")
+        registry.save_live_request(
+            request_id="legacy", lane="coding", session_id="stored-1",
+            prompt_sha256="0" * 64, fingerprint="legacy-fp", status="unknown",
+        )
+        gateway.history_rows = [{"role": "user", "text": "whatever", "row_id": 1}]
+
+        result = service.reconcile(request_id="legacy")
+
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["error_code"], "reconcile_boundary_missing")
+        self.assertEqual(result["reconciliation"], "legacy_record_without_boundary")
+
+    def test_legacy_registry_database_gets_attribution_columns(self):
+        gateway = FakeGateway()
+        service, registry = self.make_service(gateway)
+        registry.close()
+        legacy_path = registry.path
+        legacy_path.unlink()
+
+        conn = sqlite3.connect(legacy_path)
+        conn.executescript(
+            """
+            CREATE TABLE lanes (lane TEXT PRIMARY KEY, session_id TEXT NOT NULL, updated_at REAL NOT NULL);
+            CREATE TABLE requests (
+                request_id TEXT PRIMARY KEY, lane TEXT NOT NULL, session_id TEXT, run_id TEXT,
+                idempotency_key TEXT NOT NULL UNIQUE, fingerprint TEXT NOT NULL, status TEXT NOT NULL,
+                error_code TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL
+            );
+            CREATE TABLE live_requests (
+                request_id TEXT PRIMARY KEY, lane TEXT NOT NULL, session_id TEXT NOT NULL,
+                prompt_sha256 TEXT NOT NULL, fingerprint TEXT NOT NULL, status TEXT NOT NULL,
+                runtime_session_id TEXT, start_seq INTEGER, error_code TEXT,
+                created_at REAL NOT NULL, updated_at REAL NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO live_requests(request_id, lane, session_id, prompt_sha256, fingerprint, status,"
+            " created_at, updated_at) VALUES ('legacy-row', 'coding', 'stored-1', '0hash', 'fp', 'unknown', 0, 0)"
+        )
+        conn.commit()
+        conn.close()
+
+        reopened = StateRegistry(legacy_path)
+        self.addCleanup(reopened.close)
+        reopened.save_live_request(
+            request_id="fresh", lane="coding", session_id="stored-1",
+            prompt_sha256="1" * 64, fingerprint="fp2", status="pending",
+            attribution="claimed", proof_seq=4, proof_epoch="epoch-1",
+            inflight_sha256="2" * 64, boundary_row_id=0, boundary_count=0,
+        )
+        record = reopened.live_request_by_id("fresh")
+        assert record is not None
+        self.assertEqual(record["attribution"], "claimed")
+        self.assertEqual(record["boundary_row_id"], 0)
+        legacy = reopened.live_request_by_id("legacy-row")
+        assert legacy is not None
+        self.assertIsNone(legacy["boundary_row_id"])
 
 
 if __name__ == "__main__":
