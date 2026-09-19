@@ -1,6 +1,8 @@
 # Hermes upstream research snapshot
 
 Research date: **2026-09-20**.
+Fresh current-main SHA checked for the Stage 2.2B handoff:
+`8a92051f20e6b371c4ff1a46a5bcec7138cc4e8c`.
 
 This document records facts relevant to hermes-zcode-bridge. It deliberately
 separates stable release behavior, current-main observations and open proposals.
@@ -72,29 +74,36 @@ Examples:
 /p/coder/api/sessions/<id>/chat/stream
 ~~~
 
-Important auth property:
+Important routing/auth properties verified on current main:
 
 - the named profile prefix expects that profile's own `API_SERVER_KEY`;
 - the default profile key is not a universal credential for named prefixes;
-- unknown/unserved profiles fail closed.
+- missing named-profile key fails closed rather than inheriting the owner key;
+- unknown/unserved profile prefixes fail closed;
+- Runs idempotency is scoped upstream by profile/principal identity.
 
 This makes Stage 2.2B multi-profile routing a correctness/security requirement
 for a public bridge, not a convenience feature.
 
 ## TUI session profile semantics
 
-Current TUI contracts include profile on both create and resume families.
+Current TUI contracts make profile broader than a create/resume option.
 
-`session.create` accepts a profile and binds the runtime record to the resolved
-profile home.
-
-`session.resume` can also be profile-scoped so Hermes opens/reads the correct
-profile state database.
+`session.create` inherits `ProfileParams`. `SessionParams` contains both
+`session_id` and optional `profile`, and current session-addressed methods
+inherit it. That covers resume/activate/status/history/interrupt/events and
+ordinary prompt submission.
 
 Bridge implication:
 
 - passing profile only on create is insufficient;
-- profile must survive bridge process restart and accompany durable resume.
+- profile must survive bridge process restart and accompany resume;
+- profile must also follow live status/history/prompt/control/replay requests so
+  a stored/runtime ID is never resolved under the wrong profile scope.
+
+Current canonical profile IDs are lowercase and match
+`^[a-z0-9][a-z0-9_-]{0,63}$`; `default` is the special default alias. Hermes
+remains authority for profile existence/reserved names.
 
 ## 4007 session lifecycle semantics
 
@@ -117,7 +126,8 @@ which is a genuine missing target.
 The bridge should narrowly retry the first condition and must not interpret all
 4007 errors as "create a new session".
 
-This is the first Stage 2.2A coding task.
+Stage 2.2A implemented this exact bounded retry in bridge PR #5; independent
+review confirmed the predicate still matches current upstream literally.
 
 ## Ordinary prompt identity limitation
 
