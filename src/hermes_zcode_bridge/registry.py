@@ -298,6 +298,26 @@ class StateRegistry:
             self._conn.commit()
             self._tighten_permissions()
 
+    def mark_live_request_awaiting_recovery(self, request_id: str, error_code: str | None) -> bool:
+        """Compare-and-set a live request into the conservative recovery state.
+
+        Terminal outcomes (completed/failed/interrupted/reconciled) are never
+        overwritten: a stale concurrent waiter that observed a conservative
+        condition must not erase an already-delivered terminal result. Returns
+        True when the row now carries the recovery state, False when a
+        terminal state was already committed.
+        """
+        with self._lock:
+            cursor = self._conn.execute(
+                """UPDATE live_requests SET status='unknown', error_code=?, updated_at=?
+                   WHERE request_id=?
+                     AND status NOT IN ('completed','failed','interrupted','reconciled')""",
+                (error_code, time.time(), request_id),
+            )
+            self._conn.commit()
+            self._tighten_permissions()
+            return cursor.rowcount > 0
+
     def live_request_by_id(self, request_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._conn.execute("SELECT * FROM live_requests WHERE request_id=?", (request_id,)).fetchone()

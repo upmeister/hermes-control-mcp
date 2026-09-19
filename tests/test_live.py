@@ -1366,6 +1366,59 @@ class LiveServiceTests(unittest.TestCase):
         result = service.reconcile(request_id="live-queued-rec")
         self.assertEqual(result["status"], "reconciled")
 
+    def test_recovery_cas_never_overwrites_terminal_state(self):
+        gateway = FakeGateway()
+        service, registry = self.make_service(gateway)
+        registry.save_live_request(
+            request_id="cas-term", lane="cas", session_id="stored", prompt_sha256="0" * 64,
+            fingerprint="f", status="completed", runtime_session_id="runtime-1",
+        )
+        # A delivered terminal outcome must survive a stale recovery write.
+        self.assertFalse(registry.mark_live_request_awaiting_recovery("cas-term", "completion_not_observed"))
+        self.assertEqual(registry.live_request_by_id("cas-term")["status"], "completed")
+
+        registry.save_live_request(
+            request_id="cas-live", lane="cas", session_id="stored", prompt_sha256="0" * 64,
+            fingerprint="f", status="streaming", runtime_session_id="runtime-1",
+        )
+        self.assertTrue(registry.mark_live_request_awaiting_recovery("cas-live", "completion_not_observed"))
+        record = registry.live_request_by_id("cas-live")
+        self.assertEqual(record["status"], "unknown")
+        self.assertEqual(record["error_code"], "completion_not_observed")
+
+    def test_stale_waiter_replays_terminal_outcome_after_lost_recovery_race(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, registry = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        runtime = opened["session_id"]
+        service.prompt(
+            lane="coding", session_id=runtime, text="race survivor", request_id="live-race-term",
+        )
+        # Deterministic scheduling probe: the stale waiter observed a
+        # conservative foreign-turn condition, but the other waiter commits the
+        # terminal outcome before the stale waiter's recovery write lands.
+        original_mark = registry.mark_live_request_awaiting_recovery
+
+        def interleaved_mark(request_id, error_code):
+            registry.update_live_request(request_id, status="completed", error_code=None)
+            return original_mark(request_id, error_code)
+
+        registry.mark_live_request_awaiting_recovery = interleaved_mark
+
+        foreign = gateway.turn_state(runtime)
+        foreign["inflight_user"] = "someone else"
+        gateway.emit_event(gateway.sockets[0], runtime, "message.complete",
+                           {"status": "complete", "text": "foreign"})
+
+        waited = service.wait(request_id="live-race-term", timeout_seconds=1)
+
+        # The stale waiter must replay the delivered terminal row, not erase it.
+        self.assertEqual(waited["status"], "completed")
+        self.assertTrue(waited.get("replayed"))
+        record = registry.live_request_by_id("live-race-term")
+        self.assertEqual(record["status"], "completed")
+
     def test_wait_timeout_keeps_row_retriable(self):
         gateway = FakeGateway()
         gateway.complete_delay = None
