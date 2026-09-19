@@ -134,7 +134,11 @@ post-boundary prompts, которые нельзя различить, оста�
 текущим ходом через inflight snapshot (SHA-256 stripped prompt text); ack `queued` не
 доказывается и остаётся консервативным. Байт-в-байт одинаковые prompts от двух writers в
 одной session остаются фундаментальным ограничением протокола Hermes (нет server-issued
-turn/admission ID); такие случаи документированы как known limitation.
+turn/admission ID); такие случаи документированы как known limitation. Дополнительно:
+живой чужой ход в inflight-снапшоте делает `live_wait` консервативным
+(`completion_not_observed`), приём completion требует отсутствия inflight-снапшота;
+truncated/ошибочный replay сессии также переводит `live_wait` в консервативный режим
+(durable recovery через `live_reconcile`/`live_history`).
 
 ## Подключение ZCode через SSH
 
