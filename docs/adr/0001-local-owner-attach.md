@@ -1,6 +1,6 @@
 # ADR-0001: Private owner adapter for Stage 2 live attach
 
-- **Status:** Accepted for Stage 2 merge; owner adapter remains opt-in/default-disabled and production enablement is separate.
+- **Status:** Accepted for Stage 2 merge. The adapter remains opt-in/default-disabled in code; later production enablement/deployment is an operational choice, not part of this ADR's original merge gate.
 - **Scope:** `hermes-zcode-bridge` Stage 2 live attach.
 - **Decision:** Use an opt-in, process-bound Unix-domain-socket owner adapter in the same Hermes web server/event loop. The bridge consumes its private lease and never reuses Dashboard `/api/ws` authentication.
 
@@ -139,3 +139,25 @@ GO for the reviewed owner/bridge scope. The full Hermes suite did not finish
 within the 420-second runner limit, so that remains a documented release
 limitation; owner enablement and any consuming semantic smoke are still
 separate operational gates.
+
+
+## Post-acceptance status note — 2026-09-20
+
+The release-boundary paragraph above records the conditions under which ADR-0001
+was originally accepted; it is historical evidence, not a statement that the
+adapter has never been enabled since.
+
+After acceptance, Stage 2/2.1 was deployed and exercised in the project's
+production environment. The architectural decision remains unchanged: live
+attach uses the same owner runtime through the private local boundary and does
+not reuse Dashboard credentials.
+
+For current project status, roadmap and upstream migration strategy, see:
+
+- `../../README.md`
+- `../ROADMAP.md`
+- `../UPSTREAM-HERMES.md`
+
+The owner adapter is still an out-of-tree Hermes seam. Public release must not
+describe it as a stock Hermes endpoint until an equivalent supported upstream
+contract exists.
