@@ -16,7 +16,10 @@ All notable user-facing changes to this local bridge are documented here.
   turn-state-unavailable `ambiguous_turn` deliberately keep the request
   retriable. The unproven/queued wait result is now reported as
   `unknown`/`ambiguous_turn` (previously the stale `queued`/`streaming`
-  status) to match the persisted state.
+  status) to match the persisted state. The recovery write is a
+  terminal-preserving compare-and-set: a stale concurrent waiter that
+  observed a conservative condition replays the already-delivered terminal
+  outcome instead of erasing it.
 - Stored-session attach is resilient to the Hermes reattach race: a JSON-RPC
   `4007 "session no longer live; retry resume"` during `session.resume`
   receives exactly one immediate retry of the identical resume (an
