@@ -1,3 +1,9 @@
+> **Status: historical / complete.** Stage 2.2A was implemented by PR #5
+> and squash-merged as `999ccff928257ea072f956e657a7c98bf71fb8c0`.
+> Final receipt: 79 tests; Pytna remediation/reread PASS; independent review PASS.
+> The current coding contract is
+> [STAGE-2.2B-IMPLEMENTATION-BRIEF.md](STAGE-2.2B-IMPLEMENTATION-BRIEF.md).
+
 # Stage 2.2A implementation brief — lifecycle recovery
 
 This is the exact contract for the next coding PR.
