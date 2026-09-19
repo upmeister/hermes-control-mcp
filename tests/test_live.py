@@ -1111,6 +1111,33 @@ class LiveServiceTests(unittest.TestCase):
         self.assertEqual(waited["error_code"], "completion_not_observed")
         self.assertIsNone(waited.get("answer"))
 
+    def test_reconnect_during_wait_without_candidate_is_conservative(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        runtime = opened["session_id"]
+        service.prompt(
+            lane="coding", session_id=runtime, text="overlap timeout", request_id="live-overlap-timeout",
+        )
+        # Deterministic scheduling probe with NO candidate: live_reconnect
+        # overlaps the wait, nothing is retained, and the blocking read times
+        # out on the new connection generation. The stale proof must not
+        # report the request as still running either.
+        real_next = service.client.next_completion
+
+        def reconnect_during_wait(session_id, *, after_seq, timeout):
+            service.reconnect()
+            return real_next(session_id, after_seq=after_seq, timeout=timeout)
+
+        service.client.next_completion = reconnect_during_wait
+
+        waited = service.wait(request_id="live-overlap-timeout", timeout_seconds=0.3)
+
+        self.assertEqual(waited["status"], "unknown")
+        self.assertEqual(waited["error_code"], "completion_not_observed")
+        self.assertIsNone(waited.get("answer"))
+
     def test_replay_degradation_survives_runtime_rotation(self):
         gateway = FakeGateway()
         gateway.complete_delay = None

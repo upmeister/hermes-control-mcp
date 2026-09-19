@@ -490,6 +490,22 @@ class LiveService:
                     event = self.client.next_completion(runtime, after_seq=cursor, timeout=remaining)
                 except LiveError as exc:
                     return self._error(exc, request_id=request_id, session_id=runtime)
+            if (
+                self.client.connection_generation() != current_generation
+                or self.client.health().get("replay_epoch") != current_epoch
+            ):
+                # Checked after EVERY blocking event read, candidate or not: a
+                # reconnect (or epoch rotation) while this wait was blocked
+                # voids the proof watermark, so no buffered ordering is
+                # admissible anymore and the turn must not be reported as
+                # still running either.
+                return self._result(
+                    status="unknown", request_id=request_id, session_id=runtime, stored_session_id=stored,
+                    error_code="completion_not_observed", replayed=True,
+                    error=("The live connection was re-established during the wait; buffered ordering "
+                           "cannot attribute completions. Use live_reconcile/live_history for durable recovery."),
+                    attribution=attribution,
+                )
             if event is None:
                 snapshot = self._running_turn_snapshot(runtime)
                 if snapshot is not None and not snapshot["running"] and snapshot.get("inflight_user") is None:
@@ -504,21 +520,6 @@ class LiveService:
                     status="running", request_id=request_id, session_id=runtime, stored_session_id=stored,
                     error_code="wait_timeout",
                     error="Live prompt is still active; call live_wait or live_events again",
-                    attribution=attribution,
-                )
-            if (
-                self.client.connection_generation() != current_generation
-                or self.client.health().get("replay_epoch") != current_epoch
-            ):
-                # A reconnect (or epoch rotation) happened while this wait was
-                # blocked. The proof watermark belongs to the previous
-                # connection, so no buffered candidate is admissible anymore,
-                # regardless of the gateway-side snapshot.
-                return self._result(
-                    status="unknown", request_id=request_id, session_id=runtime, stored_session_id=stored,
-                    error_code="completion_not_observed", replayed=True,
-                    error=("The live connection was re-established during the wait; buffered ordering "
-                           "cannot attribute completions. Use live_reconcile/live_history for durable recovery."),
                     attribution=attribution,
                 )
             if self.client.events_truncated(runtime, after_seq=cursor):
