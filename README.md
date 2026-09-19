@@ -89,7 +89,7 @@ live_health
 Several identifiers that look similar are intentionally kept separate:
 
 - **profile** — Hermes configuration/state/memory boundary;
-- **lane** — bridge-side stable routing name;
+- **lane** — bridge-side stable routing name (unique per profile, not globally);
 - **stored session ID** — durable Hermes conversation identity;
 - **runtime session ID** — ephemeral ID owned by one live TUI gateway process;
 - **run ID** — one durable API execution;
@@ -97,6 +97,21 @@ Several identifiers that look similar are intentionally kept separate:
 - **connection generation / replay epoch / event sequence** — live transport evidence.
 
 For live calls, prefer the bridge lane after opening a session. Runtime session IDs are ephemeral and must not be treated as durable handles.
+
+## Profile routing
+
+Hermes profile identity is a first-class routing and security boundary. The public invariant is:
+
+~~~text
+(profile, lane) -> stored_session_id
+~~~
+
+- An omitted `profile` uses the default profile; an existing lane/session/run/request identity may supply the profile by inference when exactly one profile is bound, and lane-only lookups fail closed with `lane_profile_ambiguous` when several profiles share the lane name. A supplied profile that disagrees with a stored identity is a conflict, never a reroute.
+- The same lane name may legally exist in two profiles; live runtime routing keys on `(profile, lane)`.
+- Live create/resume/activate, prompt submission, status/history/events, steer and interrupt carry the resolved profile; it survives restart, reconnect and reconcile (reconcile uses the request's stored profile). The transient `4007` resume retry repeats the identical profile-scoped params.
+- Durable API calls for a named profile route through Hermes `/p/<profile>/...` and resolve that profile's own `API_SERVER_KEY` from `<profiles_root>/<profile>/.env` (`--profiles-root`, default `$HERMES_HOME/profiles`). A missing named-profile key fails closed; the default profile key is never inherited for named profiles.
+- Profile ids mirror the upstream Hermes syntax `^[a-z0-9][a-z0-9_-]{0,63}$` and are validated before any filesystem or URL use.
+- The registry stores profile names as routing metadata — never keys or other secret material. Existing databases migrate additively: legacy rows read as `default`.
 
 ## Safety and recovery rules
 
@@ -202,13 +217,14 @@ The project uses deterministic fake transports for most protocol tests plus real
 - **Stage 2** — private owner attach to an existing live Hermes TUI runtime.
 - **Stage 2.1** — shared-turn attribution hardening, replay conservatism, boundary-aware reconciliation, and atomic live request reservation.
 - **Stage 2.2A** — actionable conservative wait recovery plus one bounded retry for Hermes' exact transient `4007 "session no longer live; retry resume"` race. Merged as `999ccff`; independent review: PASS.
+- **Stage 2.2B** — first-class multi-profile routing: profile-aware lane/request registry with safe legacy migration, profile-scoped live create/resume/control across restart and reconnect, durable `/p/<profile>/...` routing with per-profile credentials, and fail-closed ambiguity/conflict handling.
 
 ### Next: Stage 2.2 — public-beta foundation
 
 Stage 2.2 is intentionally split into bounded PRs:
 
 1. **Lifecycle recovery — complete (Stage 2.2A).** Conservative wait results persist reconcilable state; bounded single retry for Hermes' transient resume race; genuine missing sessions stay fail-closed.
-2. **First-class multi-profile routing — now (Stage 2.2B).** Profile becomes part of durable lane identity, survives restart/resume, scopes every live TUI call, and routes durable API work through Hermes `/p/<profile>/...` with the profile's own API key.
+2. **First-class multi-profile routing — complete (Stage 2.2B).** Profile is part of durable lane identity, survives restart/resume, scopes every live TUI call, and routes durable API work through Hermes `/p/<profile>/...` with the profile's own API key.
 3. **Public packaging/hardening — next (Stage 2.2C).** Client-neutral naming/docs, clean-install smoke, CI/release metadata, registry schema ownership and generic examples.
 
 Research gates run alongside implementation:

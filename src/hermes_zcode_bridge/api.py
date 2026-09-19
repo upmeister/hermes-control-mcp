@@ -8,8 +8,10 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from .config import BridgeConfig
+from .profiles import PROFILE_ID_RE, named_profile_api_key
 
 
 @dataclass(slots=True)
@@ -51,21 +53,57 @@ def _json_body(body: bytes) -> dict[str, Any]:
 
 
 class HermesAPIClient:
-    """Small stdlib HTTP client for the authenticated Hermes API Server."""
+    """Small stdlib HTTP client for the authenticated Hermes API Server.
+
+    The default profile keeps the configured api_url and default key. A named
+    profile routes through the Hermes multiplex prefix ``/p/<profile>/...`` and
+    resolves that profile's OWN ``API_SERVER_KEY`` from its profile .env at
+    request time; the default key is never borrowed, and a missing named key
+    fails closed. Key rotation needs no bridge state migration because named
+    keys are re-read per request.
+    """
 
     def __init__(self, config: BridgeConfig, *, transport: Callable[..., APIResponse] | None = None):
         self.config = config
         self._api_key = config.resolved_api_key()
         self._transport = transport
 
-    def _url(self, path: str) -> str:
+    def _endpoint(self, profile: str | None) -> tuple[str, str]:
+        """(base_url, bearer_key) for the requested profile.
+
+        Raises APIError (never leaking key material) when the profile id is
+        invalid, the configured api_url cannot take a profile prefix, or the
+        named profile has no usable key of its own.
+        """
+        if not profile or profile == "default":
+            return self.config.api_url, self._api_key
+        if not PROFILE_ID_RE.match(profile):
+            raise APIError(0, "invalid_profile", f"refusing to route invalid profile id through the API")
+        parts = urlsplit(self.config.api_url)
+        if parts.path not in ("", "/"):
+            raise APIError(
+                0,
+                "profile_route_config_error",
+                "api_url already contains a path; /p/<profile> routing requires a root api_url",
+            )
+        key = named_profile_api_key(profile, self.config.resolved_profiles_root())
+        if not key:
+            raise APIError(
+                0,
+                "profile_key_unavailable",
+                f"Named profile {profile!r} has no usable API_SERVER_KEY in its profile .env; "
+                "the default profile key is never inherited for named profiles",
+            )
+        return f"{parts.scheme}://{parts.netloc}/p/{profile}", key
+
+    def _url(self, path: str, base: str) -> str:
         if not path.startswith("/"):
             path = "/" + path
-        return self.config.api_url + path
+        return base + path
 
-    def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+    def _headers(self, key: str, extra: dict[str, str] | None = None) -> dict[str, str]:
         headers = {
-            "Authorization": f"Bearer {self._api_key}",
+            "Authorization": f"Bearer {key}",
             "Accept": "application/json",
             "User-Agent": "hermes-zcode-bridge/0.1",
         }
@@ -97,14 +135,16 @@ class HermesAPIClient:
         payload: dict[str, Any] | None = None,
         extra_headers: dict[str, str] | None = None,
         raw: bool = False,
+        profile: str | None = None,
     ) -> dict[str, Any] | bytes:
+        base, key = self._endpoint(profile)
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8") if payload is not None else None
-        headers = self._headers(extra_headers)
+        headers = self._headers(key, extra_headers)
         if body is not None:
             headers["Content-Type"] = "application/json"
         try:
             response = (self._transport or self._urllib_transport)(
-                method, self._url(path), headers, body, self.config.request_timeout
+                method, self._url(path, base), headers, body, self.config.request_timeout
             )
         except APIError:
             raise
@@ -133,7 +173,7 @@ class HermesAPIClient:
             raise APIError(
                 response.status,
                 code,
-                _redact(message, self._api_key),
+                _redact(message, key),
                 retryable=response.status in {408, 409, 425, 429} or response.status >= 500,
             )
         if raw:
@@ -153,6 +193,7 @@ class HermesAPIClient:
         model: str | None = None,
         provider: str | None = None,
         instructions: str | None = None,
+        profile: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"input": prompt}
         for key, value in (
@@ -168,37 +209,43 @@ class HermesAPIClient:
             "/v1/runs",
             payload=payload,
             extra_headers={"Idempotency-Key": idempotency_key},
+            profile=profile,
         )
         return result if isinstance(result, dict) else {}
 
-    def status(self, run_id: str) -> dict[str, Any]:
-        result = self._request("GET", f"/v1/runs/{urllib.parse.quote(run_id, safe='')}")
+    def status(self, run_id: str, *, profile: str | None = None) -> dict[str, Any]:
+        result = self._request("GET", f"/v1/runs/{urllib.parse.quote(run_id, safe='')}", profile=profile)
         return result if isinstance(result, dict) else {}
 
-    def stop(self, run_id: str) -> dict[str, Any]:
-        result = self._request("POST", f"/v1/runs/{urllib.parse.quote(run_id, safe='')}/stop", payload={})
-        return result if isinstance(result, dict) else {}
-
-    def steer(self, run_id: str, text: str) -> dict[str, Any]:
+    def stop(self, run_id: str, *, profile: str | None = None) -> dict[str, Any]:
         result = self._request(
-            "POST", f"/v1/runs/{urllib.parse.quote(run_id, safe='')}/steer", payload={"input": text}
+            "POST", f"/v1/runs/{urllib.parse.quote(run_id, safe='')}/stop", payload={}, profile=profile
         )
         return result if isinstance(result, dict) else {}
 
-    def history(self, session_id: str, *, limit: int = 100) -> dict[str, Any]:
+    def steer(self, run_id: str, text: str, *, profile: str | None = None) -> dict[str, Any]:
+        result = self._request(
+            "POST", f"/v1/runs/{urllib.parse.quote(run_id, safe='')}/steer", payload={"input": text},
+            profile=profile,
+        )
+        return result if isinstance(result, dict) else {}
+
+    def history(self, session_id: str, *, limit: int = 100, profile: str | None = None) -> dict[str, Any]:
         query = urllib.parse.urlencode({"order": "oldest", "limit": max(1, min(int(limit), 500))})
         result = self._request(
-            "GET", f"/api/sessions/{urllib.parse.quote(session_id, safe='')}/messages?{query}"
+            "GET", f"/api/sessions/{urllib.parse.quote(session_id, safe='')}/messages?{query}",
+            profile=profile,
         )
         return result if isinstance(result, dict) else {}
 
-    def events(self, run_id: str, *, timeout: float | None = None) -> list[dict[str, Any]]:
+    def events(self, run_id: str, *, timeout: float | None = None, profile: str | None = None) -> list[dict[str, Any]]:
         """Collect the server's SSE stream; status polling remains recovery authority."""
         raw = self._request(
             "GET",
             f"/v1/runs/{urllib.parse.quote(run_id, safe='')}/events",
             extra_headers={"Accept": "text/event-stream"},
             raw=True,
+            profile=profile,
         )
         if not isinstance(raw, bytes):
             return []
@@ -215,14 +262,14 @@ class HermesAPIClient:
                 events.append(parsed)
         return events
 
-    def health(self) -> dict[str, Any]:
-        result = self._request("GET", "/health")
+    def health(self, *, profile: str | None = None) -> dict[str, Any]:
+        result = self._request("GET", "/health", profile=profile)
         return result if isinstance(result, dict) else {}
 
-    def models(self) -> dict[str, Any]:
-        result = self._request("GET", "/v1/models")
+    def models(self, *, profile: str | None = None) -> dict[str, Any]:
+        result = self._request("GET", "/v1/models", profile=profile)
         return result if isinstance(result, dict) else {}
 
-    def capabilities(self) -> dict[str, Any]:
-        result = self._request("GET", "/v1/capabilities")
+    def capabilities(self, *, profile: str | None = None) -> dict[str, Any]:
+        result = self._request("GET", "/v1/capabilities", profile=profile)
         return result if isinstance(result, dict) else {}

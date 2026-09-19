@@ -31,6 +31,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key-env", default=DEFAULT_API_KEY_ENV, help="Environment variable containing API key")
     parser.add_argument("--env-file", type=Path, help="Optional server-side dotenv file to read keys/tokens from")
     parser.add_argument("--state-db", type=Path, default=default_state_db(), help="Safe local registry SQLite path")
+    parser.add_argument(
+        "--profiles-root", type=Path, default=None,
+        help="Named-profiles root for profile-scoped API keys (default: $HERMES_HOME/profiles)",
+    )
     parser.add_argument("--timeout", type=float, default=120.0, help="HTTP request timeout in seconds")
     parser.add_argument("--poll-interval", type=float, default=0.5, help="Default wait polling interval")
     parser.add_argument("--gateway-url", help="Hermes TUI WebSocket URL, e.g. ws://127.0.0.1:9119/api/ws")
@@ -79,6 +83,7 @@ def main(argv: list[str] | None = None) -> int:
         config = BridgeConfig(
             api_url=args.api_url,
             state_db=args.state_db,
+            profiles_root=args.profiles_root,
             request_timeout=args.timeout,
             poll_interval=args.poll_interval,
             api_key_env=args.api_key_env,
