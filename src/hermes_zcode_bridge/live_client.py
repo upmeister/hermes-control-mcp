@@ -173,6 +173,12 @@ class LiveGatewayClient:
         self._retired_request_id_set: set[str] = set()
         self._replay_epoch: str | None = None
         self._epoch_changed_on_connect = False
+        # Monotonic connection generation: increments every time this client
+        # opens a socket. Ownership proofs captured on an older generation lost
+        # their event-stream continuity and must be re-proven, because a
+        # reconnect (even within the same replay epoch) can silently drop
+        # events between disconnect and replay.
+        self._generation = 0
         self._replay_hold: dict[str, list[dict[str, Any]]] | None = None
         self._replay_hold_bytes = 0
         self._replay_gap_allowed: set[str] = set()
@@ -350,6 +356,8 @@ class LiveGatewayClient:
             if ready is None or not ready.is_set():
                 raise LiveError("live gateway handshake did not include gateway.ready", code="gateway_ready_missing")
             self._set_state("open")
+            with self._state_lock:
+                self._generation += 1
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(socket))
             while True:
                 raw = await socket.recv()
@@ -930,6 +938,11 @@ class LiveGatewayClient:
         with self._state_lock:
             return dict(self._watermarks)
 
+    def connection_generation(self) -> int:
+        """Monotonic counter of successful connections (see ``_generation``)."""
+        with self._state_lock:
+            return self._generation
+
     def events(self, session_id: str, *, after_seq: int = 0) -> list[dict[str, Any]]:
         with self._state_lock:
             buffer = self._events.get(session_id)
@@ -970,6 +983,7 @@ class LiveGatewayClient:
                 "connection_state": self._state,
                 "auth_mode": self.config.live_auth_mode(),
                 "replay_epoch": self._replay_epoch,
+                "generation": self._generation,
                 "watermarks": dict(self._watermarks),
                 "event_sessions": len(self._events),
                 "event_count": sum(len(buffer) for buffer in self._events.values()),
