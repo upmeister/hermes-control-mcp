@@ -173,6 +173,12 @@ class LiveGatewayClient:
         self._retired_request_id_set: set[str] = set()
         self._replay_epoch: str | None = None
         self._epoch_changed_on_connect = False
+        # Monotonic connection generation: increments every time this client
+        # opens a socket. Ownership proofs captured on an older generation lost
+        # their event-stream continuity and must be re-proven, because a
+        # reconnect (even within the same replay epoch) can silently drop
+        # events between disconnect and replay.
+        self._generation = 0
         self._replay_hold: dict[str, list[dict[str, Any]]] | None = None
         self._replay_hold_bytes = 0
         self._replay_gap_allowed: set[str] = set()
@@ -350,6 +356,8 @@ class LiveGatewayClient:
             if ready is None or not ready.is_set():
                 raise LiveError("live gateway handshake did not include gateway.ready", code="gateway_ready_missing")
             self._set_state("open")
+            with self._state_lock:
+                self._generation += 1
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(socket))
             while True:
                 raw = await socket.recv()
@@ -930,6 +938,11 @@ class LiveGatewayClient:
         with self._state_lock:
             return dict(self._watermarks)
 
+    def connection_generation(self) -> int:
+        """Monotonic counter of successful connections (see ``_generation``)."""
+        with self._state_lock:
+            return self._generation
+
     def events(self, session_id: str, *, after_seq: int = 0) -> list[dict[str, Any]]:
         with self._state_lock:
             buffer = self._events.get(session_id)
@@ -942,25 +955,43 @@ class LiveGatewayClient:
         with self._state_lock:
             return after_seq < self._event_evicted_through.get(session_id, 0)
 
-    def wait_for_completion(self, session_id: str, *, after_seq: int = 0, timeout: float = 120.0) -> dict[str, Any] | None:
-        """Wait for the next ``message.start`` → ``message.complete`` pair."""
+    def replay_degraded(self, session_id: str) -> bool:
+        """True when the most recent reconnect's replay lost events for this session.
+
+        A truncated replay means events were lost from the buffered stream, so
+        buffered ordering cannot prove whose completion is whose. The marker is
+        deliberately NOT keyed by the session id: a reconnect/resume remaps
+        live requests onto a fresh runtime id, and degradation of the previous
+        runtime's replay must survive that rotation. Errored replays and
+        replay-epoch changes degrade the whole connection the same way;
+        callers must recover through durable history.
+        """
+        with self._state_lock:
+            last_replay = self._last_replay
+        if not isinstance(last_replay, dict):
+            return False
+        truncated = last_replay.get("truncated")
+        errors = last_replay.get("errors")
+        if isinstance(truncated, list) and truncated:
+            return True
+        if isinstance(errors, list) and errors:
+            return True
+        return bool(last_replay.get("epoch_changed"))
+
+    def next_completion(self, session_id: str, *, after_seq: int = 0, timeout: float = 120.0) -> dict[str, Any] | None:
+        """Wait for the next ``message.complete`` event after ``after_seq``.
+
+        Returns ``None`` on timeout. Deliberately candidate-only: whether a
+        completion belongs to a specific bridge request is an ownership decision
+        the service makes with gateway-side evidence, not a buffer-order fact.
+        """
         deadline = time.monotonic() + max(0.0, timeout)
-        started = False
-        start_seq: int | None = None
         with self._events_condition:
             while True:
                 buffer = self._events.get(session_id) or ()
                 for item in buffer:
-                    if item.seq is not None and item.seq <= after_seq:
-                        continue
-                    kind = item.event.get("type")
-                    if not started and kind == "message.start":
-                        started = True
-                        start_seq = item.seq
-                        continue
-                    if started and kind == "message.complete":
-                        if start_seq is None or item.seq is None or item.seq > start_seq:
-                            return copy.deepcopy(item.event)
+                    if item.seq is not None and item.seq > after_seq and item.event.get("type") == "message.complete":
+                        return copy.deepcopy(item.event)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None
@@ -975,6 +1006,7 @@ class LiveGatewayClient:
                 "connection_state": self._state,
                 "auth_mode": self.config.live_auth_mode(),
                 "replay_epoch": self._replay_epoch,
+                "generation": self._generation,
                 "watermarks": dict(self._watermarks),
                 "event_sessions": len(self._events),
                 "event_count": sum(len(buffer) for buffer in self._events.values()),

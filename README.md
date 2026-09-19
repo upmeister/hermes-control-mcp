@@ -70,14 +70,25 @@ Stage 2 live tools:
 - `live_prompt` — отправить prompt в существующий TUI session; переносы строк и
   tab сохраняются буквально; `wait_seconds` опционально ждёт terminal event;
   при явном `session_id` это runtime ID, поэтому для обычного потока предпочитай `lane`;
-- `live_wait` — дождаться пары `message.start` → `message.complete`;
+- `live_wait` — дождаться completion текущего live prompt. Владение ходом доказывается через
+  gateway-side inflight evidence (`session.activate`): ход другого attached клиента с другим
+  prompt не возвращается как ответ локального запроса. Если доказать владение нельзя (queued
+  submit, отсутствие inflight evidence, degraded replay — усечение/ошибка replay или смена
+  replay epoch) — `live_wait` возвращает консервативный `ambiguous_turn` /
+  `completion_not_observed` вместо возможного чужого ответа. Фундаментальное исключение
+  описано в known limitation ниже: байт-в-байт одинаковый prompt другого writer'а
+  неразличим, и его completion в terminal window МОЖЕТ быть возвращён как локальный ответ;
 - `live_events` — прочитать bounded in-memory event buffer после `after_seq`;
   при явном `session_id` это runtime ID, поэтому предпочитай `lane`;
 - `live_status` / `live_history` — recovery reads; при явном `session_id` ожидают
   runtime ID, для стабильного доступа используй `lane`;
 - `live_steer` / `live_interrupt` — exact-session controls; явный `session_id`
   также является runtime ID, поэтому предпочитай `lane`;
-- `live_reconcile` — проверить неизвестный submit по durable history, не повторяя его;
+- `live_reconcile` — проверить неизвестный submit по durable history, не повторяя его. Перед
+  submit фиксируется redacted pre-submit boundary (max user `row_id`); после submit
+  кандидаты матчатся только строго после boundary. Старый идентичный prompt не может
+  рекомсилить новый submit; несколько одинаковых post-boundary строк дают консервативный
+  `ambiguous_history_match`; строки без boundary metadata не рекомсятся никогда;
 - `live_reconnect` — новый WS generation + replay retained events;
 - `live_health` — auth/connection/replay/buffer health без LLM turn.
 
@@ -119,8 +130,31 @@ Stage 2 live tools:
 Для live `prompt.submit` acknowledgement без ответа помечается
 `status: "unknown", error_code: "transport_unknown"`. Bridge не отправляет
 такой prompt повторно — даже после перезапуска MCP процесса. Сначала вызывается
-`live_reconcile`; history match является evidence, но одинаковые повторные
-prompts нельзя различить абсолютно.
+`live_reconcile`: boundary-aware history match является evidence, но одинаковые
+post-boundary prompts, которые нельзя различить, остаются консервативно `unknown`.
+
+Атрибуция completion в shared runtime: запрос с ack `streaming` доказывает владение
+текущим ходом через inflight snapshot (SHA-256 stripped prompt text); ack `queued` не
+доказывается и остаётся консервативным. Байт-в-байт одинаковые prompts от двух writers в
+одной session остаются фундаментальным ограничением протокола Hermes (нет server-issued
+turn/admission ID, upstream U2). Конкретный небезопасный исход этого known limitation:
+если локальный ход завершился, а другой writer в terminal window (или в окне потери
+событий при reconnect) успел отправить байт-в-байт тот же prompt, приём completion может
+вернуть ответ ЧУЖОГО хода как ответ локального запроса. Bridge устраняет все устранимые
+варианты этого класса, но сам класс неустраним без upstream turn-identity seam.
+
+Дополнительные conservative-правила `live_wait`: живой чужой ход в inflight-снапшоте
+делает результат консервативным (`completion_not_observed`); приём completion требует
+отсутствия inflight-снапшота; retained failed-turn снапшот принимается только с terminal
+error-кандидатом (success payload под retained failure — консервативный), а упавший ход
+никогда не возвращает `answer` — fallback-текст gateway error-payload попадает в `error`,
+не в ответ; reconnect, произошедший ВО ВРЕМЯ блокирующего `live_wait`, инвалидирует proof —
+wait перепроверяет connection generation и replay epoch перед приёмом любого кандидата;
+truncated/ошибочный replay ИЛИ смена replay epoch (ротация runtime очищает буфер — то же
+окно потери событий) переводят `live_wait` в консервативный режим даже при успешном
+re-proof, и маркер деградации переживает ротацию runtime id; продолжать ожидание после
+re-proof можно только после чистого same-epoch reconnect с полным replay (durable
+recovery через `live_reconcile`/`live_history`).
 
 ## Подключение ZCode через SSH
 
