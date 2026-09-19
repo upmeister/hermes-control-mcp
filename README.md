@@ -7,7 +7,7 @@ The project started as a ZCode integration, but the bridge itself is an MCP stdi
 - **Durable runs** over the Hermes API Server for idempotent, detachable work.
 - **Live shared sessions** for attaching to the same Hermes TUI/Desktop runtime without creating a second session authority.
 
-> **Project status:** Stage 2.1 is deployed and in active use. The merged Stage 2.1 hardening PR completed with 71 tests green. The project is not public-release-ready yet: live owner attach currently depends on an out-of-tree Hermes owner-adapter seam, multi-profile routing is only partially modeled, and packaging/security ergonomics still need a public-beta pass.
+> **Project status:** Stage 2.2A is merged after independent review. The bridge now has the Stage 2.1 shared-turn safety model plus actionable wait→reconcile recovery and a bounded retry for Hermes' transient resume race. Stage 2.2B is the current implementation milestone: make Hermes profile identity first-class across lanes, durable API routing and live resume/control. The project is not public-release-ready yet: live owner attach still depends on an out-of-tree Hermes seam, and packaging/release hardening follows multi-profile correctness.
 
 ## Why this exists
 
@@ -201,14 +201,15 @@ The project uses deterministic fake transports for most protocol tests plus real
 - **Stage 1** — durable MCP control plane over the Hermes Runs API.
 - **Stage 2** — private owner attach to an existing live Hermes TUI runtime.
 - **Stage 2.1** — shared-turn attribution hardening, replay conservatism, boundary-aware reconciliation, and atomic live request reservation.
+- **Stage 2.2A** — actionable conservative wait recovery plus one bounded retry for Hermes' exact transient `4007 "session no longer live; retry resume"` race. Merged as `999ccff`; independent review: PASS.
 
 ### Next: Stage 2.2 — public-beta foundation
 
 Stage 2.2 is intentionally split into bounded PRs:
 
-1. **Lifecycle recovery** — implemented (Stage 2.2A): conservative wait results persist reconcilable state; bounded single retry for Hermes' transient "session no longer live; retry resume" race; genuine missing sessions stay fail-closed.
-2. **First-class multi-profile routing** — make profile part of durable lane identity, preserve it across restart/resume, and route durable API requests through Hermes `/p/<profile>/...` with profile-scoped credentials.
-3. **Public packaging/hardening** — client-neutral naming/docs, clean-install smoke, CI/release metadata, registry schema ownership and generic examples.
+1. **Lifecycle recovery — complete (Stage 2.2A).** Conservative wait results persist reconcilable state; bounded single retry for Hermes' transient resume race; genuine missing sessions stay fail-closed.
+2. **First-class multi-profile routing — now (Stage 2.2B).** Profile becomes part of durable lane identity, survives restart/resume, scopes every live TUI call, and routes durable API work through Hermes `/p/<profile>/...` with the profile's own API key.
+3. **Public packaging/hardening — next (Stage 2.2C).** Client-neutral naming/docs, clean-install smoke, CI/release metadata, registry schema ownership and generic examples.
 
 Research gates run alongside implementation:
 
@@ -224,7 +225,7 @@ Hermes is moving quickly in exactly the areas this bridge depends on. As of the 
 
 - the stable release is v0.21.3 / v2026.9.14;
 - the API Server supports a richer Agent Sessions API, including session chat and SSE streaming;
-- multiplexed profiles are served through `/p/<profile>/...` with profile-scoped authentication;
+- multiplexed profiles are served through `/p/<profile>/...` with profile-scoped authentication; current TUI `SessionParams` also carries `profile`, so create-only profile routing is insufficient;
 - upstream PR #106742 proposes one gateway-owned session authority across local surfaces, including durable admission identity and multi-profile ownership;
 - issue #109891 discusses making that gateway a first-class Desktop backend;
 - issue #62857 proposes scoped native WebSocket grants.
@@ -260,7 +261,8 @@ Until then, keeping the bridge standalone lets it iterate quickly without coupli
 ## Documentation
 
 - [Stage 2.2 roadmap](docs/ROADMAP.md)
-- [Next coding PR implementation brief](docs/STAGE-2.2-IMPLEMENTATION-BRIEF.md)
+- [Current Stage 2.2B coding contract](docs/STAGE-2.2B-IMPLEMENTATION-BRIEF.md)
+- [Historical Stage 2.2A implementation brief](docs/STAGE-2.2-IMPLEMENTATION-BRIEF.md)
 - [Hermes upstream research](docs/UPSTREAM-HERMES.md)
 - [API Server / Agent Sessions parity spike](docs/API-SERVER-PARITY-SPIKE.md)
 - [Distribution and upstreaming strategy](docs/DISTRIBUTION-AND-UPSTREAMING.md)
