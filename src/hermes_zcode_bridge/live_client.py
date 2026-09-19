@@ -956,21 +956,27 @@ class LiveGatewayClient:
             return after_seq < self._event_evicted_through.get(session_id, 0)
 
     def replay_degraded(self, session_id: str) -> bool:
-        """True when the most recent reconnect's replay lost events for a session.
+        """True when the most recent reconnect's replay lost events for this session.
 
-        A truncated or errored replay (or a replay-epoch change) means the
-        buffered event stream has gaps, so buffered ordering cannot prove whose
-        completion is whose; callers must recover through durable history.
+        A truncated replay means events were lost from the buffered stream, so
+        buffered ordering cannot prove whose completion is whose. The marker is
+        deliberately NOT keyed by the session id: a reconnect/resume remaps
+        live requests onto a fresh runtime id, and degradation of the previous
+        runtime's replay must survive that rotation. Errored replays and
+        replay-epoch changes degrade the whole connection the same way;
+        callers must recover through durable history.
         """
         with self._state_lock:
             last_replay = self._last_replay
-        truncated = last_replay.get("truncated") if isinstance(last_replay, dict) else None
-        errors = last_replay.get("errors") if isinstance(last_replay, dict) else None
-        if isinstance(truncated, list) and session_id in truncated:
+        if not isinstance(last_replay, dict):
+            return False
+        truncated = last_replay.get("truncated")
+        errors = last_replay.get("errors")
+        if isinstance(truncated, list) and truncated:
             return True
         if isinstance(errors, list) and errors:
             return True
-        return bool(last_replay.get("epoch_changed")) if isinstance(last_replay, dict) else False
+        return bool(last_replay.get("epoch_changed"))
 
     def next_completion(self, session_id: str, *, after_seq: int = 0, timeout: float = 120.0) -> dict[str, Any] | None:
         """Wait for the next ``message.complete`` event after ``after_seq``.

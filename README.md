@@ -71,10 +71,13 @@ Stage 2 live tools:
   tab сохраняются буквально; `wait_seconds` опционально ждёт terminal event;
   при явном `session_id` это runtime ID, поэтому для обычного потока предпочитай `lane`;
 - `live_wait` — дождаться completion текущего live prompt. Владение ходом доказывается через
-  gateway-side inflight evidence (`session.activate`): чужой ход другого attached клиента никогда
-  не возвращается как ответ локального запроса. Если доказать владение нельзя (queued submit,
-  отсутствие inflight evidence, смена replay epoch) — `live_wait` возвращает консервативный
-  `ambiguous_turn` / `completion_not_observed` вместо возможного чужого ответа;
+  gateway-side inflight evidence (`session.activate`): ход другого attached клиента с другим
+  prompt не возвращается как ответ локального запроса. Если доказать владение нельзя (queued
+  submit, отсутствие inflight evidence, degraded replay — усечение/ошибка replay или смена
+  replay epoch) — `live_wait` возвращает консервативный `ambiguous_turn` /
+  `completion_not_observed` вместо возможного чужого ответа. Фундаментальное исключение
+  описано в known limitation ниже: байт-в-байт одинаковый prompt другого writer'а
+  неразличим, и его completion в terminal window МОЖЕТ быть возвращён как локальный ответ;
 - `live_events` — прочитать bounded in-memory event buffer после `after_seq`;
   при явном `session_id` это runtime ID, поэтому предпочитай `lane`;
 - `live_status` / `live_history` — recovery reads; при явном `session_id` ожидают
@@ -134,11 +137,21 @@ post-boundary prompts, которые нельзя различить, оста�
 текущим ходом через inflight snapshot (SHA-256 stripped prompt text); ack `queued` не
 доказывается и остаётся консервативным. Байт-в-байт одинаковые prompts от двух writers в
 одной session остаются фундаментальным ограничением протокола Hermes (нет server-issued
-turn/admission ID); такие случаи документированы как known limitation. Дополнительно:
-живой чужой ход в inflight-снапшоте делает `live_wait` консервативным
-(`completion_not_observed`), приём completion требует отсутствия inflight-снапшота;
-truncated/ошибочный replay сессии также переводит `live_wait` в консервативный режим
-(durable recovery через `live_reconcile`/`live_history`).
+turn/admission ID, upstream U2). Конкретный небезопасный исход этого known limitation:
+если локальный ход завершился, а другой writer в terminal window (или в окне потери
+событий при reconnect) успел отправить байт-в-байт тот же prompt, приём completion может
+вернуть ответ ЧУЖОГО хода как ответ локального запроса. Bridge устраняет все устранимые
+варианты этого класса, но сам класс неустраним без upstream turn-identity seam.
+
+Дополнительные conservative-правила `live_wait`: живой чужой ход в inflight-снапшоте
+делает результат консервативным (`completion_not_observed`); приём completion требует
+отсутствия inflight-снапшота; retained failed-turn снапшот принимается только с terminal
+error-кандидатом (success payload под retained failure — консервативный);
+truncated/ошибочный replay ИЛИ смена replay epoch (ротация runtime очищает буфер — то же
+окно потери событий) переводят `live_wait` в консервативный режим даже при успешном
+re-proof, и маркер деградации переживает ротацию runtime id; продолжать ожидание после
+re-proof можно только после чистого same-epoch reconnect с полным replay (durable
+recovery через `live_reconcile`/`live_history`).
 
 ## Подключение ZCode через SSH
 

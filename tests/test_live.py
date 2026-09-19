@@ -75,6 +75,9 @@ class FakeGateway:
         self.mode = "normal"
         self.complete_delay: float | None = 0.15
         self.inflight_enabled = True
+        # When set, session.events.since responses report truncated=True so the
+        # client's real replay path records the degradation marker itself.
+        self.truncated_replay = False
         self.history_rows: list[dict] = []
         self.turns: dict[str, dict] = {}
 
@@ -187,7 +190,8 @@ class FakeGateway:
                     socket.push({
                         "jsonrpc": "2.0", "id": rid,
                         "result": {"session_id": frame["params"]["session_id"], "events": [],
-                                   "latest_seq": 1, "truncated": False, "epoch": self.epoch,
+                                   "latest_seq": 1, "truncated": self.truncated_replay,
+                                   "epoch": self.epoch,
                                    "count": 0, "open_requests": []},
                     })
             elif method == "prompt.submit":
@@ -854,7 +858,7 @@ class LiveServiceTests(unittest.TestCase):
         self.assertEqual(waited["error_code"], "completion_not_observed")
         self.assertIsNone(waited.get("answer"))
 
-    def test_wait_after_rotation_reproves_still_running_turn(self):
+    def test_wait_after_epoch_rotation_is_conservative_despite_successful_reproof(self):
         gateway = FakeGateway()
         gateway.complete_delay = None
         service, _ = self.make_service(gateway)
@@ -865,6 +869,11 @@ class LiveServiceTests(unittest.TestCase):
         )
         gateway.epoch = "epoch-2"
 
+        # An epoch rotation clears the buffered stream, so events emitted
+        # before the rotation may be gone: the same loss window as a truncated
+        # replay. A fresh inflight proof of the still-running turn re-anchors
+        # the cursor but cannot restore ordering evidence, so the wait stays
+        # conservative and routes to durable recovery.
         service.reconnect()
         resumed_state = gateway.turn_state("runtime-resumed")
         resumed_state["running"] = True
@@ -872,8 +881,8 @@ class LiveServiceTests(unittest.TestCase):
 
         waited = service.wait(request_id="live-rotate-running", timeout_seconds=0.4)
 
-        self.assertEqual(waited["status"], "running")
-        self.assertEqual(waited["error_code"], "wait_timeout")
+        self.assertEqual(waited["status"], "unknown")
+        self.assertEqual(waited["error_code"], "completion_not_observed")
         self.assertIsNone(waited.get("answer"))
 
     def test_wait_after_same_epoch_reconnect_reproves_and_completes(self):
@@ -962,21 +971,23 @@ class LiveServiceTests(unittest.TestCase):
         )
 
         # Same-epoch reconnect while the claimed turn still runs: the fresh
-        # inflight proof succeeds and a new cursor is established...
+        # inflight proof succeeds, but the gateway reports the replay for this
+        # connection as truncated (real session.events.since response path), so
+        # buffered ordering can no longer attribute any completion, even one
+        # arriving after the re-proof.
+        gateway.truncated_replay = True
         service.reconnect()
         resumed = gateway.turn_state("runtime-resumed")
         resumed["running"] = True
         resumed["inflight_user"] = text
-        waited = service.wait(request_id="live-gap", timeout_seconds=0.3)
-        self.assertEqual(waited["status"], "running")
 
-        # ...but THIS connection's replay was truncated, so buffered ordering
-        # can no longer attribute any completion for the session, even one
-        # arriving after the re-proof.
-        assert service.client._last_replay is not None
-        service.client._last_replay = {
-            "replayed": 0, "truncated": ["runtime-resumed"], "errors": [], "epoch_changed": False,
-        }
+        waited = service.wait(request_id="live-gap", timeout_seconds=0.3)
+        self.assertEqual(waited["status"], "unknown")
+        self.assertEqual(waited["error_code"], "completion_not_observed")
+        self.assertIsNone(waited.get("answer"))
+
+        # The post-gap completion must still not be accepted: durable recovery
+        # (live_reconcile/live_history) is the only admissible path here.
         resumed["running"] = False
         resumed["inflight_user"] = None
         gateway.emit_event(
@@ -1011,6 +1022,67 @@ class LiveServiceTests(unittest.TestCase):
         self.assertEqual(waited["status"], "failed")
         self.assertEqual(waited["error_code"], "live_turn_failed")
         self.assertFalse(waited.get("answer"))
+
+    def test_success_payload_during_retained_failure_is_conservative(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        runtime = opened["session_id"]
+        service.prompt(
+            lane="coding", session_id=runtime, text="failing turn", request_id="live-fail-inject",
+        )
+        # Non-conforming ordering: a retained failed-turn snapshot followed by
+        # a SUCCESS completion must never be attributed to the local request.
+        failed = gateway.turn_state(runtime)
+        failed["inflight_error"] = True
+        gateway.emit_event(gateway.sockets[0], runtime, "message.complete",
+                           {"status": "complete", "text": "foreign-success"})
+
+        waited = service.wait(request_id="live-fail-inject", timeout_seconds=0.5)
+
+        self.assertEqual(waited["status"], "unknown")
+        self.assertEqual(waited["error_code"], "completion_not_observed")
+        self.assertIsNone(waited.get("answer"))
+
+    def test_replay_degradation_survives_runtime_rotation(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        text = "rotation survivor"
+        service.prompt(
+            lane="coding", session_id=opened["session_id"], text=text, request_id="live-gap-rotate",
+        )
+
+        # Same-epoch reconnect while the claimed turn still runs; the gateway
+        # reports the replay for the OLD runtime id as truncated (real
+        # session.events.since response path). The resume remaps the request
+        # onto a new runtime id, and the degradation marker must survive that
+        # rotation instead of being keyed away — otherwise a post-gap
+        # completion could be accepted after a successful re-proof.
+        gateway.truncated_replay = True
+        service.reconnect()
+        resumed = gateway.turn_state("runtime-resumed")
+        resumed["running"] = True
+        resumed["inflight_user"] = text
+
+        waited = service.wait(request_id="live-gap-rotate", timeout_seconds=0.4)
+        self.assertEqual(waited["status"], "unknown")
+        self.assertEqual(waited["error_code"], "completion_not_observed")
+        self.assertIsNone(waited.get("answer"))
+
+        # Even a completion buffered after the rotation stays unattributable.
+        resumed["running"] = False
+        resumed["inflight_user"] = None
+        gateway.emit_event(
+            gateway.sockets[-1], "runtime-resumed", "message.complete",
+            {"status": "complete", "text": "after-rotation"},
+        )
+        waited = service.wait(request_id="live-gap-rotate", timeout_seconds=0.4)
+        self.assertEqual(waited["status"], "unknown")
+        self.assertEqual(waited["error_code"], "completion_not_observed")
+        self.assertIsNone(waited.get("answer"))
 
     def test_concurrent_same_request_id_submits_exactly_once(self):
         gateway = FakeGateway()
