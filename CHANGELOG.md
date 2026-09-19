@@ -6,6 +6,28 @@ All notable user-facing changes to this local bridge are documented here.
 
 ### Fixed
 
+- Lifecycle recovery (Stage 2.2A): a conservative `live_wait` result that
+  hands a request to durable recovery (`completion_not_observed`, and
+  `ambiguous_turn` when ownership cannot be proven and reconciliation is
+  advised) now persists `status=unknown` with the conservative error code
+  before returning, so its own recovery advice is actionable —
+  `live_reconcile` accepts only rows stored as `unknown`. Ordinary bounded
+  `wait_timeout` with a still-running turn and the retriable
+  turn-state-unavailable `ambiguous_turn` deliberately keep the request
+  retriable. The unproven/queued wait result is now reported as
+  `unknown`/`ambiguous_turn` (previously the stale `queued`/`streaming`
+  status) to match the persisted state. The recovery write is a
+  terminal-preserving compare-and-set: a stale concurrent waiter that
+  observed a conservative condition replays the already-delivered terminal
+  outcome instead of erasing it.
+- Stored-session attach is resilient to the Hermes reattach race: a JSON-RPC
+  `4007 "session no longer live; retry resume"` during `session.resume`
+  receives exactly one immediate retry of the identical resume (an
+  attach/rebuild of the same stored identity, not a mutation retry); a second
+  transient failure, and a genuine `4007 "session not found"`, return the
+  normal structured error with no retry loop and no automatic session
+  creation.
+
 - Live completion attribution: in a shared attached session, `live_wait` no
   longer accepts the first `message.complete` after a sequence cursor as the
   local answer. A submit acknowledged `streaming` proves ownership of the
