@@ -1,6 +1,112 @@
 # Hermes upstream research snapshot
 
 Research date: **2026-09-20**.
+Fresh current-main SHA checked for the Stage 2.2B handoff:
+`8a92051f20e6b371c4ff1a46a5bcec7138cc4e8c`.
+
+This document records facts relevant to hermes-zcode-bridge. It deliberately
+separates stable release behavior, current-main observations and open proposals.
+
+Upstream changes quickly; re-verify before implementing against an internal
+field or assuming an open proposal landed.
+
+## Stable release
+
+Latest stable release observed during this research:
+
+~~~text
+Hermes Agent v0.21.3
+tag: v2026.9.14
+release date: 2026-09-14
+~~~
+
+The release notes describe a large roll-up since v0.21.2, including remote
+Desktop auth fixes, state.db handle fixes and additional undocumented-at-release
+work around gateway contracts and multiplex profile isolation.
+
+## API Server: important changes for this project
+
+Current Hermes documentation exposes three relevant programmatic families:
+
+- OpenAI-compatible endpoints;
+- Runs API;
+- Agent Sessions API.
+
+The Agent Sessions API now includes:
+
+~~~text
+GET    /api/sessions
+POST   /api/sessions
+GET    /api/sessions/{id}
+PATCH  /api/sessions/{id}
+DELETE /api/sessions/{id}
+GET    /api/sessions/{id}/messages
+POST   /api/sessions/{id}/fork
+POST   /api/sessions/{id}/chat
+POST   /api/sessions/{id}/chat/stream
+~~~
+
+The streaming session-turn endpoint emits agent progress and a terminal run
+outcome. This makes it a plausible durable/session-oriented substrate for some
+future bridge operations.
+
+It does **not** by itself prove parity with live owner attach: the bridge still
+needs the TUI owner path when the requirement is to participate in the exact
+same Desktop/TUI runtime and event stream.
+
+See [API-SERVER-PARITY-SPIKE.md](API-SERVER-PARITY-SPIKE.md).
+
+## Multiplex profiles
+
+Hermes current main treats multiplexing as a first-class gateway topology.
+
+The API Server serves named profiles under:
+
+~~~text
+/p/<profile>/...
+~~~
+
+Examples:
+
+~~~text
+/p/coder/v1/runs
+/p/coder/api/sessions
+/p/coder/api/sessions/<id>/chat/stream
+~~~
+
+Important routing/auth properties verified on current main:
+
+- the named profile prefix expects that profile's own `API_SERVER_KEY`;
+- the default profile key is not a universal credential for named prefixes;
+- missing named-profile key fails closed rather than inheriting the owner key;
+- unknown/unserved profile prefixes fail closed;
+- Runs idempotency is scoped upstream by profile/principal identity.
+
+This makes Stage 2.2B multi-profile routing a correctness/security requirement
+for a public bridge, not a convenience feature.
+
+## TUI session profile semantics
+
+Current TUI contracts make profile broader than a create/resume option.
+
+`session.create` inherits `ProfileParams`. `SessionParams` contains both
+`session_id` and optional `profile`, and current session-addressed methods
+inherit it. That covers resume/activate/status/history/interrupt/events and
+ordinary prompt submission.
+
+Bridge implication:
+
+- passing profile only on create is insufficient;
+- profile must survive bridge process restart and accompany resume;
+- profile must also follow live status/history/prompt/control/replay requests so
+  a stored/runtime ID is never resolved under the wrong profile scope.
+
+Current canonical profile IDs are lowercase and match
+`^[a-z0-9][a-z0-9_-]{0,63}# Hermes upstream research snapshot
+
+Research date: **2026-09-20**.
+Fresh current-main SHA checked for the Stage 2.2B handoff:
+`8a92051f20e6b371c4ff1a46a5bcec7138cc4e8c`.
 
 This document records facts relevant to hermes-zcode-bridge. It deliberately
 separates stable release behavior, current-main observations and open proposals.
@@ -83,18 +189,8 @@ for a public bridge, not a convenience feature.
 
 ## TUI session profile semantics
 
-Current TUI contracts include profile on both create and resume families.
-
-`session.create` accepts a profile and binds the runtime record to the resolved
-profile home.
-
-`session.resume` can also be profile-scoped so Hermes opens/reads the correct
-profile state database.
-
-Bridge implication:
-
-- passing profile only on create is insufficient;
-- profile must survive bridge process restart and accompany durable resume.
+; `default` is the special default alias. Hermes
+remains authority for profile existence/reserved names.
 
 ## 4007 session lifecycle semantics
 
@@ -117,7 +213,8 @@ which is a genuine missing target.
 The bridge should narrowly retry the first condition and must not interpret all
 4007 errors as "create a new session".
 
-This is the first Stage 2.2A coding task.
+Stage 2.2A implemented this exact bounded retry in bridge PR #5; independent
+review confirmed the predicate still matches current upstream literally.
 
 ## Ordinary prompt identity limitation
 
