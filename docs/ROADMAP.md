@@ -71,7 +71,17 @@ Stage 2.2 is a family of bounded PRs, not one branch.
 
 ### Stage 2.2A — lifecycle recovery
 
-Priority: first coding PR.
+Status: **complete** — PR #5 merged as `999ccff`; 79-test receipt, Pytna
+remediation/reread PASS, independent review PASS.
+
+Independent review retained one LOW observability note: two concurrent
+conservative waiters may leave the last recovery `error_code` on an already
+unknown row. This cannot produce false success, duplicate a mutation or prevent
+reconciliation, so it is not a milestone blocker.
+
+Historical contract: [STAGE-2.2-IMPLEMENTATION-BRIEF.md](STAGE-2.2-IMPLEMENTATION-BRIEF.md).
+
+Completed outcomes:
 
 Goals:
 
@@ -92,11 +102,14 @@ Not in scope:
 - cross-platform owner transport;
 - package release.
 
-Exact contract: [STAGE-2.2-IMPLEMENTATION-BRIEF.md](STAGE-2.2-IMPLEMENTATION-BRIEF.md).
-
 ### Stage 2.2B — first-class multi-profile routing
 
+Status: **NOW**.
+
 Priority: release blocker for public beta.
+
+Exact contract:
+[STAGE-2.2B-IMPLEMENTATION-BRIEF.md](STAGE-2.2B-IMPLEMENTATION-BRIEF.md).
 
 Problem today:
 
