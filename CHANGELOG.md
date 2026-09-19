@@ -41,7 +41,10 @@ All notable user-facing changes to this local bridge are documented here.
   the claimed turn's completion yet).
 - Any reconnect (even within the same replay epoch) invalidates the ownership
   proof: `live_wait` re-proves the claim via a fresh inflight snapshot and
-  persists the re-proven cursor, or returns `completion_not_observed`.
+  persists the re-proven cursor, or returns `completion_not_observed`. A
+  reconnect that overlaps an already-running `live_wait` is caught too: the
+  wait re-checks the connection generation and replay epoch before accepting
+  any buffered candidate.
 - Live `request_id` reservation is an atomic SQLite INSERT: concurrent calls
   with the same request_id can never submit two gateway mutations.
 - A live foreign-turn inflight snapshot (a prompt that is not the claimed one)
@@ -50,7 +53,9 @@ All notable user-facing changes to this local bridge are documented here.
   A retained FAILED-turn snapshot (the gateway keeps it, with an error marker,
   while emitting the terminal completion) is recognized as the local failure
   only for a terminal error candidate, reported as `failed`/`live_turn_failed`
-  with no answer; a success payload under a retained failure snapshot is a
+  with no answer — even when the gateway's error payload carries fallback
+  failure copy in `text`; that copy is surfaced through `error`, never as the
+  answer. A success payload under a retained failure snapshot is a
   non-conforming ordering and stays conservative
   (`completion_not_observed`).
 - A truncated or errored replay, or a replay-epoch change (a runtime rotation

@@ -146,7 +146,10 @@ turn/admission ID, upstream U2). Конкретный небезопасный �
 Дополнительные conservative-правила `live_wait`: живой чужой ход в inflight-снапшоте
 делает результат консервативным (`completion_not_observed`); приём completion требует
 отсутствия inflight-снапшота; retained failed-turn снапшот принимается только с terminal
-error-кандидатом (success payload под retained failure — консервативный);
+error-кандидатом (success payload под retained failure — консервативный), а упавший ход
+никогда не возвращает `answer` — fallback-текст gateway error-payload попадает в `error`,
+не в ответ; reconnect, произошедший ВО ВРЕМЯ блокирующего `live_wait`, инвалидирует proof —
+wait перепроверяет connection generation и replay epoch перед приёмом любого кандидата;
 truncated/ошибочный replay ИЛИ смена replay epoch (ротация runtime очищает буфер — то же
 окно потери событий) переводят `live_wait` в консервативный режим даже при успешном
 re-proof, и маркер деградации переживает ротацию runtime id; продолжать ожидание после
