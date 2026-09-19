@@ -213,6 +213,27 @@ class LiveService:
             return None, opened
         return None, self._result(status="failed", error_code="live_session_not_open", error="Call live_session_open first")
 
+    _TRANSIENT_RESUME_4007 = "session no longer live; retry resume"
+
+    def _resume_stored(self, target: str) -> Any:
+        # Hermes reattach race (session_lifecycle._reattach_refusal): a resume
+        # can lose the race against a reap/retire of the live record it just
+        # looked up and receive the transient JSON-RPC 4007 semantic that
+        # explicitly instructs the client to retry resume. Exactly ONE
+        # immediate retry of the identical resume is allowed: re-attaching
+        # repeats the same rebuild operation against the same stored identity
+        # and is not a prompt/steer/interrupt mutation retry. Genuine 4007
+        # "session not found" (an empty draft that never became durable, for
+        # example) receives zero retries and stays fail-closed; a second
+        # transient failure surfaces through the normal structured error path.
+        try:
+            return self.client.request("session.resume", {"session_id": target})
+        except LiveRPCError as exc:
+            normalized = " ".join(str(exc).split()).lower()
+            if exc.rpc_code != 4007 or normalized != self._TRANSIENT_RESUME_4007:
+                raise
+            return self.client.request("session.resume", {"session_id": target})
+
     def open(
         self,
         *,
@@ -239,7 +260,7 @@ class LiveService:
                 return connected
             target = supplied or current
             if target:
-                reply = self.client.request("session.resume", {"session_id": target})
+                reply = self._resume_stored(target)
             else:
                 params: dict[str, Any] = {
                     "source": "tool", "close_on_disconnect": bool(close_on_disconnect),
@@ -384,6 +405,31 @@ class LiveService:
             self.registry.update_live_request(request_id, status=status, error_code=exc.code)
             return self._error(exc, request_id=request_id, session_id=runtime)
 
+    def _mark_awaiting_recovery(self, request_id: str, error_code: str | None) -> dict[str, Any] | None:
+        # A conservative wait result that hands the request to durable recovery
+        # must persist that state: live_reconcile accepts only rows stored as
+        # unknown, so leaving a streaming/claimed row behind would make the
+        # result's own recovery advice unactionable. The ordinary bounded
+        # wait_timeout (the turn is still running) and the retriable
+        # turn-state-unavailable ambiguous_turn deliberately stay unmarked.
+        #
+        # The write is a terminal-preserving compare-and-set: a stale
+        # concurrent waiter that observed a conservative condition must not
+        # erase a terminal outcome another waiter already committed. When this
+        # waiter loses that race it replays the delivered terminal row instead
+        # of returning its own stale conservative result.
+        if self.registry.mark_live_request_awaiting_recovery(request_id, error_code):
+            return None
+        record = self.registry.live_request_by_id(request_id)
+        if record is not None and record.get("status") in {"completed", "failed", "interrupted", "reconciled"}:
+            return self._result(
+                status=str(record["status"]), request_id=request_id,
+                session_id=record.get("runtime_session_id"), stored_session_id=record.get("session_id"),
+                replayed=True, error_code=record.get("error_code"),
+                attribution=record.get("attribution"),
+            )
+        return None
+
     def wait(
         self, *, request_id: str | None = None, lane: str | None = None, timeout_seconds: float = 120.0,
     ) -> dict[str, Any]:
@@ -428,8 +474,11 @@ class LiveService:
         if attribution != "claimed" or not inflight_sha:
             # Without claimed-turn evidence the next completion on this shared
             # session may belong to another attached client. Never return it.
+            marked = self._mark_awaiting_recovery(request_id, "ambiguous_turn")
+            if marked is not None:
+                return marked
             return self._result(
-                status=record_status if record_status != "pending" else "running",
+                status="unknown",
                 request_id=request_id, session_id=runtime, stored_session_id=stored,
                 error_code="ambiguous_turn", replayed=True,
                 error=("Ownership of the next gateway completion cannot be proven for this request; "
@@ -455,6 +504,9 @@ class LiveService:
             # recovery territory (live_reconcile/live_history).
             snapshot = self._running_turn_snapshot(runtime)
             if snapshot is None or not snapshot["running"] or not self._inflight_matches(snapshot, inflight_sha):
+                marked = self._mark_awaiting_recovery(request_id, "completion_not_observed")
+                if marked is not None:
+                    return marked
                 return self._result(
                     status="unknown", request_id=request_id, session_id=runtime, stored_session_id=stored,
                     error_code="completion_not_observed", replayed=True,
@@ -474,6 +526,9 @@ class LiveService:
             # This connection's replay lost events (for any runtime id — a
             # resume rotates the id, and the degradation must survive that);
             # buffered ordering cannot attribute completions.
+            marked = self._mark_awaiting_recovery(request_id, "completion_not_observed")
+            if marked is not None:
+                return marked
             return self._result(
                 status="unknown", request_id=request_id, session_id=runtime, stored_session_id=stored,
                 error_code="completion_not_observed", replayed=True,
@@ -499,6 +554,9 @@ class LiveService:
                 # voids the proof watermark, so no buffered ordering is
                 # admissible anymore and the turn must not be reported as
                 # still running either.
+                marked = self._mark_awaiting_recovery(request_id, "completion_not_observed")
+                if marked is not None:
+                    return marked
                 return self._result(
                     status="unknown", request_id=request_id, session_id=runtime, stored_session_id=stored,
                     error_code="completion_not_observed", replayed=True,
@@ -509,6 +567,9 @@ class LiveService:
             if event is None:
                 snapshot = self._running_turn_snapshot(runtime)
                 if snapshot is not None and not snapshot["running"] and snapshot.get("inflight_user") is None:
+                    marked = self._mark_awaiting_recovery(request_id, "completion_not_observed")
+                    if marked is not None:
+                        return marked
                     return self._result(
                         status="unknown", request_id=request_id, session_id=runtime, stored_session_id=stored,
                         error_code="completion_not_observed", replayed=True,
@@ -525,6 +586,9 @@ class LiveService:
             if self.client.events_truncated(runtime, after_seq=cursor):
                 # The ring evicted events between the proof cursor and here, so
                 # buffer order no longer proves whose completion this is.
+                marked = self._mark_awaiting_recovery(request_id, "completion_not_observed")
+                if marked is not None:
+                    return marked
                 return self._result(
                     status="unknown", request_id=request_id, session_id=runtime, stored_session_id=stored,
                     error_code="completion_not_observed", replayed=True,
@@ -544,6 +608,9 @@ class LiveService:
                 # buffered candidate ordering cannot prove whose completion
                 # this is (failure matrix: replay truncated -> authoritative
                 # recovery or conservative result).
+                marked = self._mark_awaiting_recovery(request_id, "completion_not_observed")
+                if marked is not None:
+                    return marked
                 return self._result(
                     status="unknown", request_id=request_id, session_id=runtime, stored_session_id=stored,
                     error_code="completion_not_observed", replayed=True,
@@ -566,6 +633,9 @@ class LiveService:
                             # must never be attributed.
                             pass
                         else:
+                            marked = self._mark_awaiting_recovery(request_id, "completion_not_observed")
+                            if marked is not None:
+                                return marked
                             return self._result(
                                 status="unknown", request_id=request_id, session_id=runtime,
                                 stored_session_id=stored,
@@ -589,6 +659,9 @@ class LiveService:
                     # gateway never emits a turn's completion before clearing its
                     # inflight snapshot). This ordering cannot attribute the
                     # candidate.
+                    marked = self._mark_awaiting_recovery(request_id, "completion_not_observed")
+                    if marked is not None:
+                        return marked
                     return self._result(
                         status="unknown", request_id=request_id, session_id=runtime, stored_session_id=stored,
                         error_code="completion_not_observed", replayed=True,
