@@ -29,14 +29,16 @@ upstream/API research.
 
 - Stage 1: complete — durable /v1/runs control plane.
 - Stage 2: complete — private owner attach to one existing live runtime.
-- Stage 2.1: complete in merged code — live attribution/replay/reconciliation
-  hardening and atomic live request reservation.
-- Next coding PR: **Stage 2.2A lifecycle recovery**, defined exactly in
-  `docs/STAGE-2.2-IMPLEMENTATION-BRIEF.md`.
+- Stage 2.1: complete — live attribution/replay/reconciliation hardening and
+  atomic live request reservation.
+- Stage 2.2A: complete — actionable conservative recovery and bounded transient
+  4007 resume retry; merged as `999ccff` after adversarial + independent review.
+- Next coding PR: **Stage 2.2B first-class multi-profile routing**, defined
+  exactly in `docs/STAGE-2.2B-IMPLEMENTATION-BRIEF.md`.
 
-Do not silently fold Stage 2.2B multi-profile work, Streamable HTTP MCP,
-interactive server requests, plugin packaging or cross-platform IPC into the
-2.2A PR. Those are separate review boundaries.
+Do not silently fold Streamable HTTP MCP, interactive server requests, public
+package release, cross-platform IPC or Agent Sessions migration into the 2.2B
+PR. Those are separate review/research boundaries.
 
 ## Source of truth
 
@@ -45,7 +47,8 @@ architecture:
 
 - `README.md` — public-facing architecture/status;
 - `docs/ROADMAP.md` — milestone plan;
-- `docs/STAGE-2.2-IMPLEMENTATION-BRIEF.md` — exact next coding contract;
+- `docs/STAGE-2.2B-IMPLEMENTATION-BRIEF.md` — exact current coding contract;
+- `docs/STAGE-2.2-IMPLEMENTATION-BRIEF.md` — historical Stage 2.2A contract;
 - `docs/UPSTREAM-HERMES.md` — dated upstream research snapshot;
 - `docs/API-SERVER-PARITY-SPIKE.md` — research protocol;
 - `docs/DISTRIBUTION-AND-UPSTREAMING.md` — packaging/upstream strategy;
@@ -133,8 +136,9 @@ be inferred from ambient process state.
 - A conservative result that instructs the caller to reconcile must actually
   leave the request eligible for `live_reconcile`.
 - Hermes transient
-  `4007 "session no longer live; retry resume"` may receive only the bounded,
-  exact `session.resume` retry defined in the Stage 2.2A brief.
+  `4007 "session no longer live; retry resume"` receives only the implemented
+  bounded exact `session.resume` retry; profile-scoped resume in Stage 2.2B
+  must preserve identical profile params across that retry.
 - Genuine `4007 "session not found"` must not auto-create or fork a session.
 
 ## Registry and secret boundary
@@ -162,20 +166,30 @@ Do not expose:
 A new capability requires an explicit MCP method with its own validation and
 failure contract.
 
-## Stage 2.2A exact scope
+## Stage 2.2B exact scope
 
 The next behavioral PR must follow
-`docs/STAGE-2.2-IMPLEMENTATION-BRIEF.md`.
+`docs/STAGE-2.2B-IMPLEMENTATION-BRIEF.md`.
 
-In summary, it contains only:
+Core invariant:
 
-1. make conservative `live_wait` recovery outcomes actually reconcilable;
-2. implement one bounded retry for the exact transient Hermes 4007
-   "session no longer live; retry resume" race;
-3. preserve genuine not-found behavior;
-4. add focused regression tests and update user-facing behavior docs.
+~~~text
+(profile, lane) -> stored_session_id
+~~~
 
-It does **not** add multi-profile routing yet.
+Required high-level outcomes:
+
+1. profile-aware lane/request registry with safe legacy default migration;
+2. named profile preserved through live create, resume, reconnect, prompt,
+   history/status and controls;
+3. durable API routing through `/p/<profile>/...`;
+4. named profiles use their own `API_SERVER_KEY` and never inherit default;
+5. omitted profile may infer only one unambiguous existing lane binding;
+6. the same lane name may coexist in multiple profiles; ambiguous lane-only
+   routing fails closed.
+
+It does **not** migrate Runs to Agent Sessions, add HTTP MCP, approvals,
+cross-platform IPC, package publication or A2A orchestration.
 
 ## Upstream-awareness rules
 
