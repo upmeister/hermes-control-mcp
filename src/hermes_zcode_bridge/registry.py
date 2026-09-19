@@ -67,6 +67,7 @@ class StateRegistry:
                 attribution TEXT,
                 proof_seq INTEGER,
                 proof_epoch TEXT,
+                proof_generation INTEGER,
                 inflight_sha256 TEXT,
                 boundary_row_id INTEGER,
                 boundary_count INTEGER,
@@ -83,6 +84,7 @@ class StateRegistry:
             "attribution TEXT",
             "proof_seq INTEGER",
             "proof_epoch TEXT",
+            "proof_generation INTEGER",
             "inflight_sha256 TEXT",
             "boundary_row_id INTEGER",
             "boundary_count INTEGER",
@@ -210,6 +212,7 @@ class StateRegistry:
         attribution: str | None = None,
         proof_seq: int | None = None,
         proof_epoch: str | None = None,
+        proof_generation: int | None = None,
         inflight_sha256: str | None = None,
         boundary_row_id: int | None = None,
         boundary_count: int | None = None,
@@ -220,32 +223,69 @@ class StateRegistry:
                 """INSERT INTO live_requests(
                        request_id, lane, session_id, prompt_sha256, fingerprint,
                        status, runtime_session_id, start_seq, error_code,
-                       attribution, proof_seq, proof_epoch, inflight_sha256,
+                       attribution, proof_seq, proof_epoch, proof_generation, inflight_sha256,
                        boundary_row_id, boundary_count,
                        created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(request_id) DO UPDATE SET
                        lane=excluded.lane, session_id=excluded.session_id,
                        prompt_sha256=excluded.prompt_sha256, fingerprint=excluded.fingerprint,
                        status=excluded.status, runtime_session_id=excluded.runtime_session_id,
                        start_seq=excluded.start_seq, error_code=excluded.error_code,
                        attribution=excluded.attribution, proof_seq=excluded.proof_seq,
-                       proof_epoch=excluded.proof_epoch, inflight_sha256=excluded.inflight_sha256,
+                       proof_epoch=excluded.proof_epoch, proof_generation=excluded.proof_generation,
+                       inflight_sha256=excluded.inflight_sha256,
                        boundary_row_id=excluded.boundary_row_id,
                        boundary_count=excluded.boundary_count,
                        updated_at=excluded.updated_at""",
                 (request_id, lane, session_id, prompt_sha256, fingerprint,
                  status, runtime_session_id, start_seq, error_code,
-                 attribution, proof_seq, proof_epoch, inflight_sha256,
+                 attribution, proof_seq, proof_epoch, proof_generation, inflight_sha256,
                  boundary_row_id, boundary_count, now, now),
             )
             self._conn.commit()
             self._tighten_permissions()
 
+    def reserve_live_request(self, record: dict[str, Any]) -> bool:
+        """Atomically reserve a request_id for first submission.
+
+        The whole live submit path must guarantee at most one gateway mutation
+        per request_id, including when two callers race with the same ID. A
+        plain INSERT that fails on conflict provides that guarantee; the losing
+        caller then reads the winner's record and replays or conflicts.
+        """
+        columns = (
+            "request_id", "lane", "session_id", "prompt_sha256", "fingerprint",
+            "status", "runtime_session_id", "start_seq", "error_code",
+            "attribution", "proof_seq", "proof_epoch", "proof_generation", "inflight_sha256",
+            "boundary_row_id", "boundary_count", "created_at", "updated_at",
+        )
+        values = (
+            record.get("request_id"), record.get("lane"), record.get("session_id"),
+            record.get("prompt_sha256"), record.get("fingerprint"), record.get("status"),
+            record.get("runtime_session_id"), record.get("start_seq"), record.get("error_code"),
+            record.get("attribution"), record.get("proof_seq"), record.get("proof_epoch"),
+            record.get("proof_generation"), record.get("inflight_sha256"),
+            record.get("boundary_row_id"), record.get("boundary_count"),
+            record.get("created_at"), record.get("updated_at"),
+        )
+        placeholders = ", ".join("?" for _ in columns)
+        with self._lock:
+            try:
+                self._conn.execute(
+                    f"INSERT INTO live_requests({', '.join(columns)}) VALUES ({placeholders})",
+                    values,
+                )
+            except sqlite3.IntegrityError:
+                return False
+            self._conn.commit()
+            self._tighten_permissions()
+        return True
+
     def update_live_request(self, request_id: str, **fields: Any) -> None:
         allowed = {
             "status", "runtime_session_id", "start_seq", "error_code", "session_id", "lane",
-            "attribution", "proof_seq", "proof_epoch",
+            "attribution", "proof_seq", "proof_epoch", "proof_generation",
         }
         changes = {key: value for key, value in fields.items() if key in allowed}
         if not changes:

@@ -27,6 +27,15 @@ All notable user-facing changes to this local bridge are documented here.
 
 - `live_wait` on an already-terminal request replays the stored outcome instead
   of re-waiting for a later (possibly foreign) completion.
+- Completion acceptance matches the deployed Hermes terminal ordering: the
+  gateway clears the inflight snapshot before emitting `message.complete`, so a
+  candidate is skipped only while the inflight snapshot still matches the
+  claimed prompt, and accepted otherwise.
+- Any reconnect (even within the same replay epoch) invalidates the ownership
+  proof: `live_wait` re-proves the claim via a fresh inflight snapshot and
+  persists the re-proven cursor, or returns `completion_not_observed`.
+- Live `request_id` reservation is an atomic SQLite INSERT: concurrent calls
+  with the same request_id can never submit two gateway mutations.
 - Registry gains additive, redacted live-request columns (`attribution`,
   `proof_seq`, `proof_epoch`, `inflight_sha256`, `boundary_row_id`,
   `boundary_count`); existing databases upgrade in place and legacy rows

@@ -137,13 +137,14 @@ class LiveService:
             return False
         return hashlib.sha256(user.encode("utf-8")).hexdigest() == inflight_sha256
 
-    def _prove_running_claim(self, runtime: str, inflight_sha256: str) -> tuple[int, str] | None:
+    def _prove_running_claim(self, runtime: str, inflight_sha256: str) -> tuple[int, str, int] | None:
         """Prove the currently running turn was claimed by our own submit.
 
         The submit ack was ``streaming``, so the gateway claimed our turn. The
         inflight prompt text must hash to our submitted text; only then is the
-        running turn provably ours. Returns the post-proof replay watermark and
-        epoch so later completions can be ordered after the proof.
+        running turn provably ours. Returns the post-proof replay watermark,
+        epoch, and connection generation so later completions can be ordered
+        after the proof and invalidated by any reconnect.
         """
         snapshot = self._running_turn_snapshot(runtime)
         if snapshot is None or not snapshot["running"] or not self._inflight_matches(snapshot, inflight_sha256):
@@ -152,7 +153,7 @@ class LiveService:
         epoch = health.get("replay_epoch")
         if not isinstance(epoch, str) or not epoch:
             return None
-        return self.client.watermarks().get(runtime, 0), epoch
+        return self.client.watermarks().get(runtime, 0), epoch, self.client.connection_generation()
 
     def _capture_boundary(self, runtime: str) -> tuple[int | None, int | None]:
         """Capture the redacted pre-submit durable boundary for reconciliation.
@@ -307,8 +308,27 @@ class LiveService:
         except (InputError, TypeError, ValueError) as exc:
             return self._input_error(exc, request_id=request_id)
 
-        record = self.registry.live_request_by_id(request_id)
-        if record is not None:
+        start_seq = self.client.watermarks().get(runtime or "", 0)
+        boundary_row_id, boundary_count = self._capture_boundary(runtime or "")
+        reserved = self.registry.reserve_live_request({
+            "request_id": request_id, "lane": lane,
+            "session_id": self.registry.session_for_lane(lane) or runtime or "",
+            "prompt_sha256": prompt_sha, "fingerprint": fingerprint, "status": "pending",
+            "runtime_session_id": runtime, "start_seq": start_seq, "error_code": None,
+            "inflight_sha256": inflight_sha,
+            "boundary_row_id": boundary_row_id, "boundary_count": boundary_count,
+            "created_at": time.time(), "updated_at": time.time(),
+        })
+        if not reserved:
+            # Another call atomically won this request_id first. Exactly one
+            # submit happens per request_id even under concurrency: the loser
+            # replays the winner's record or conflicts, never resubmits.
+            record = self.registry.live_request_by_id(request_id)
+            if record is None:
+                return self._result(
+                    status="failed", request_id=request_id, session_id=runtime,
+                    error_code="request_id_conflict", error="request_id reservation state is unavailable",
+                )
             if record.get("fingerprint") != fingerprint or record.get("lane") != lane:
                 return self._result(
                     status="failed", request_id=request_id, session_id=runtime,
@@ -323,15 +343,6 @@ class LiveService:
                 replayed=True, event_cursor=record.get("start_seq"),
                 attribution=record.get("attribution"),
             )
-
-        start_seq = self.client.watermarks().get(runtime or "", 0)
-        boundary_row_id, boundary_count = self._capture_boundary(runtime or "")
-        self.registry.save_live_request(
-            request_id=request_id, lane=lane, session_id=self.registry.session_for_lane(lane) or runtime or "",
-            prompt_sha256=prompt_sha, fingerprint=fingerprint, status="pending",
-            runtime_session_id=runtime, start_seq=start_seq,
-            inflight_sha256=inflight_sha, boundary_row_id=boundary_row_id, boundary_count=boundary_count,
-        )
         try:
             params: dict[str, Any] = {"session_id": runtime, "text": text}
             if queued:
@@ -346,13 +357,15 @@ class LiveService:
             attribution = "unproven"
             proof_seq: int | None = None
             proof_epoch: str | None = None
+            proof_generation: int | None = None
             if status == "streaming":
                 proof = self._prove_running_claim(runtime or "", inflight_sha)
                 if proof is not None:
-                    attribution, proof_seq, proof_epoch = "claimed", proof[0], proof[1]
+                    attribution, proof_seq, proof_epoch, proof_generation = "claimed", proof[0], proof[1], proof[2]
             self.registry.update_live_request(
                 request_id, status=status, runtime_session_id=runtime, start_seq=start_seq,
-                error_code=None, attribution=attribution, proof_seq=proof_seq, proof_epoch=proof_epoch,
+                error_code=None, attribution=attribution, proof_seq=proof_seq,
+                proof_epoch=proof_epoch, proof_generation=proof_generation,
             )
             result = self._result(
                 status=status, request_id=request_id, session_id=runtime,
@@ -420,12 +433,22 @@ class LiveService:
                 attribution=attribution,
             )
         current_epoch = self.client.health().get("replay_epoch")
+        current_generation = self.client.connection_generation()
         proof_seq = record.get("proof_seq")
-        cursor = int(proof_seq) if isinstance(proof_seq, int) and record.get("proof_epoch") == current_epoch else None
+        cursor = None
+        if (
+            isinstance(proof_seq, int)
+            and record.get("proof_epoch") == current_epoch
+            and record.get("proof_generation") == current_generation
+        ):
+            cursor = proof_seq
         if cursor is None:
-            # The proof watermark belongs to a previous replay epoch (reconnect
-            # or gateway restart). Stream continuity is gone; the only safe way
-            # to keep waiting is a fresh inflight proof of the still-running turn.
+            # The proof watermark belongs to a previous replay epoch or a
+            # previous connection. A reconnect (even within the same epoch) can
+            # silently drop events, so stream continuity must be re-proven: the
+            # only safe way to keep waiting is a fresh inflight proof of the
+            # still-running turn; otherwise the completion is authoritative-
+            # recovery territory (live_reconcile/live_history).
             snapshot = self._running_turn_snapshot(runtime)
             if snapshot is None or not snapshot["running"] or not self._inflight_matches(snapshot, inflight_sha):
                 return self._result(
@@ -436,6 +459,13 @@ class LiveService:
                     attribution=attribution,
                 )
             cursor = self.client.watermarks().get(runtime, 0)
+            # Persist the re-proven cursor so later wait calls continue from the
+            # fresh connection's watermark instead of the stale proof cursor.
+            self.registry.update_live_request(
+                request_id, proof_seq=cursor,
+                proof_epoch=self.client.health().get("replay_epoch"),
+                proof_generation=self.client.connection_generation(),
+            )
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -448,7 +478,7 @@ class LiveService:
                     return self._error(exc, request_id=request_id, session_id=runtime)
             if event is None:
                 snapshot = self._running_turn_snapshot(runtime)
-                if snapshot is not None and not snapshot["running"]:
+                if snapshot is not None and not snapshot["running"] and snapshot.get("inflight_user") is None:
                     return self._result(
                         status="unknown", request_id=request_id, session_id=runtime, stored_session_id=stored,
                         error_code="completion_not_observed", replayed=True,
@@ -479,20 +509,19 @@ class LiveService:
                     error="Gateway turn-state evidence is unavailable; completion ownership cannot be proven.",
                     attribution=attribution,
                 )
-            if snapshot["running"]:
-                if self._inflight_matches(snapshot, inflight_sha):
-                    # Our claimed turn is still running, so this completion
-                    # belongs to a foreign turn; skip it and keep waiting.
-                    candidate_seq = event.get("seq")
-                    cursor = candidate_seq if isinstance(candidate_seq, int) else cursor
-                    continue
-                return self._result(
-                    status="unknown", request_id=request_id, session_id=runtime, stored_session_id=stored,
-                    error_code="completion_not_observed", replayed=True,
-                    error=("A foreign attached-client turn is running; the local completion was not observed. "
-                           "Use live_reconcile/live_history for durable recovery."),
-                    attribution=attribution,
-                )
+            if self._inflight_matches(snapshot, inflight_sha):
+                # The proven running turn is ours and its completion cannot have
+                # been emitted yet (the gateway clears the inflight snapshot
+                # before emitting message.complete), so this completion belongs
+                # to another turn; skip it and keep waiting.
+                candidate_seq = event.get("seq")
+                cursor = candidate_seq if isinstance(candidate_seq, int) else cursor
+                continue
+            # The inflight snapshot no longer matches our prompt: our turn has
+            # ended (the gateway clears it before emitting the completion) or a
+            # foreign turn replaced it. Under the gateway busy gate no foreign
+            # completion can precede ours after the proof cursor, so this
+            # candidate is the local completion.
             payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
             raw_status = str(payload.get("status") or "complete")
             status = {"complete": "completed", "error": "failed", "cancelled": "interrupted"}.get(raw_status, raw_status)

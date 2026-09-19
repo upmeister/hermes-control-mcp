@@ -95,11 +95,18 @@ class FakeGateway:
         self.emit_event(socket, session_id, "message.complete", {"status": "complete", "text": text})
 
     def _complete_turn(self, socket: FakeSocket, session_id: str) -> None:
+        # Source-faithful deployed ordering (prompt_turn._complete_turn_payload
+        # -> _run_after_agent_ready): the gateway clears the inflight snapshot
+        # BEFORE emitting message.complete and clears running=False later, so a
+        # completion poll can legitimately observe running=true, inflight=None.
         state = self.turn_state(session_id)
-        state["running"] = False
         state["inflight_user"] = None
         self.history_rows.append({"role": "assistant", "text": "done", "row_id": len(self.history_rows) + 1})
         self.emit_event(socket, session_id, "message.complete", {"status": "complete", "text": "done"})
+        asyncio.get_running_loop().call_later(0.05, self._end_turn, session_id)
+
+    def _end_turn(self, session_id: str) -> None:
+        self.turn_state(session_id)["running"] = False
 
     async def connect(self, url: str, **kwargs):
         self.connect_urls.append(url)
@@ -858,6 +865,86 @@ class LiveServiceTests(unittest.TestCase):
         self.assertEqual(waited["status"], "running")
         self.assertEqual(waited["error_code"], "wait_timeout")
         self.assertIsNone(waited.get("answer"))
+
+    def test_wait_after_same_epoch_reconnect_reproves_and_completes(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        text = "survives a reconnect"
+        service.prompt(
+            lane="coding", session_id=opened["session_id"], text=text, request_id="live-reconnect-ok",
+        )
+
+        # Plain reconnect: same replay epoch, new connection generation, so the
+        # proof watermark continuity is gone and a fresh inflight proof is
+        # required before any completion may be accepted.
+        service.reconnect()
+        resumed_state = gateway.turn_state("runtime-resumed")
+        resumed_state["running"] = True
+        resumed_state["inflight_user"] = text
+        waited = service.wait(request_id="live-reconnect-ok", timeout_seconds=0.3)
+        self.assertEqual(waited["status"], "running")
+
+        gateway.turn_state("runtime-resumed")["inflight_user"] = None
+        gateway.emit_event(
+            gateway.sockets[-1], "runtime-resumed", "message.complete",
+            {"status": "complete", "text": "done"},
+        )
+        gateway.turn_state("runtime-resumed")["running"] = False
+        waited = service.wait(request_id="live-reconnect-ok", timeout_seconds=1)
+
+        self.assertEqual(waited["status"], "completed")
+        self.assertEqual(waited["answer"], "done")
+
+    def test_identical_text_foreign_completion_is_never_returned_while_claim_runs(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        runtime = opened["session_id"]
+        service.prompt(
+            lane="coding", session_id=runtime, text="same text", request_id="live-same-text",
+        )
+        # A foreign turn with a byte-identical prompt produces an inflight
+        # snapshot and completion payload indistinguishable from ours; under a
+        # claimed run it must still never satisfy the local wait.
+        gateway.inject_foreign_turn(gateway.sockets[0], runtime, "done")
+
+        waited = service.wait(request_id="live-same-text", timeout_seconds=0.5)
+
+        self.assertEqual(waited["status"], "running")
+        self.assertEqual(waited["error_code"], "wait_timeout")
+        self.assertIsNone(waited.get("answer"))
+
+    def test_concurrent_same_request_id_submits_exactly_once(self):
+        gateway = FakeGateway()
+        service, registry = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        runtime = opened["session_id"]
+        barrier = threading.Barrier(2)
+        results: dict[str, dict] = {}
+
+        def submit(tag: str) -> None:
+            barrier.wait(timeout=2)
+            results[tag] = service.prompt(
+                lane="coding", session_id=runtime, text="only once",
+                request_id="live-race", wait_seconds=1.5,
+            )
+
+        threads = [threading.Thread(target=submit, args=(tag,)) for tag in ("a", "b")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertEqual(gateway.prompt_calls, 1)
+        self.assertEqual(len(results), 2)
+        statuses = {result["status"] for result in results.values()}
+        self.assertTrue(statuses <= {"completed", "streaming", "pending"}, statuses)
+        self.assertTrue("completed" in statuses)
+        replayed_flags = [bool(result.get("replayed")) for result in results.values()]
+        self.assertEqual(sorted(replayed_flags), [False, True])
 
     # ----- H2: boundary-aware unknown-submit reconciliation -----------------
 
