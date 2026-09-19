@@ -125,9 +125,13 @@ class LiveService:
         if not isinstance(reply, dict):
             return None
         inflight = reply.get("inflight")
+        error_marker = False
+        if isinstance(inflight, dict):
+            error_marker = bool(inflight.get("error")) or str(inflight.get("status") or "") == "error"
         return {
             "running": bool(reply.get("running")),
             "inflight_user": inflight.get("user") if isinstance(inflight, dict) else None,
+            "inflight_error": error_marker,
         }
 
     @staticmethod
@@ -509,19 +513,54 @@ class LiveService:
                     error="Gateway turn-state evidence is unavailable; completion ownership cannot be proven.",
                     attribution=attribution,
                 )
-            if self._inflight_matches(snapshot, inflight_sha):
-                # The proven running turn is ours and its completion cannot have
-                # been emitted yet (the gateway clears the inflight snapshot
-                # before emitting message.complete), so this completion belongs
-                # to another turn; skip it and keep waiting.
-                candidate_seq = event.get("seq")
-                cursor = candidate_seq if isinstance(candidate_seq, int) else cursor
-                continue
-            # The inflight snapshot no longer matches our prompt: our turn has
-            # ended (the gateway clears it before emitting the completion) or a
-            # foreign turn replaced it. Under the gateway busy gate no foreign
-            # completion can precede ours after the proof cursor, so this
-            # candidate is the local completion.
+            if self.client.replay_degraded(runtime):
+                # This connection's replay lost events for the session; the
+                # buffered candidate ordering cannot prove whose completion
+                # this is (failure matrix: replay truncated -> authoritative
+                # recovery or conservative result).
+                return self._result(
+                    status="unknown", request_id=request_id, session_id=runtime, stored_session_id=stored,
+                    error_code="completion_not_observed", replayed=True,
+                    error="Replay for this session was truncated; use live_reconcile/live_history for durable recovery.",
+                    attribution=attribution,
+                )
+            inflight_user = snapshot.get("inflight_user")
+            if inflight_user is not None:
+                if self._inflight_matches(snapshot, inflight_sha):
+                    if snapshot.get("inflight_error"):
+                        # Our claimed turn FAILED: the gateway retains the failed
+                        # inflight snapshot (with the error marker) while emitting
+                        # the terminal completion, so this candidate is our
+                        # failure and must be reported.
+                        pass
+                    else:
+                        # The proven running turn is ours and healthy; its
+                        # completion cannot have been emitted yet (the gateway
+                        # clears the inflight snapshot before emitting
+                        # message.complete), so this completion belongs to
+                        # another turn; skip it and keep waiting.
+                        candidate_seq = event.get("seq")
+                        cursor = candidate_seq if isinstance(candidate_seq, int) else cursor
+                        continue
+                else:
+                    # A turn whose prompt is not ours is live in the gateway
+                    # state while a completion is already buffered (a conforming
+                    # gateway never emits a turn's completion before clearing its
+                    # inflight snapshot). This ordering cannot attribute the
+                    # candidate.
+                    return self._result(
+                        status="unknown", request_id=request_id, session_id=runtime, stored_session_id=stored,
+                        error_code="completion_not_observed", replayed=True,
+                        error=("A foreign attached-client turn is live; the local completion was not observed. "
+                               "Use live_reconcile/live_history for durable recovery."),
+                        attribution=attribution,
+                    )
+            # No inflight snapshot exists: the claimed turn has ended (the
+            # gateway clears the inflight snapshot before emitting the
+            # completion) and no foreign turn is live. Under the gateway busy
+            # gate no foreign completion can precede ours after the proof
+            # cursor on a continuous connection, so this candidate is the
+            # local completion.
             payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
             raw_status = str(payload.get("status") or "complete")
             status = {"complete": "completed", "error": "failed", "cancelled": "interrupted"}.get(raw_status, raw_status)

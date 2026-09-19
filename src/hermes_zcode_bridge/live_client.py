@@ -955,6 +955,23 @@ class LiveGatewayClient:
         with self._state_lock:
             return after_seq < self._event_evicted_through.get(session_id, 0)
 
+    def replay_degraded(self, session_id: str) -> bool:
+        """True when the most recent reconnect's replay lost events for a session.
+
+        A truncated or errored replay (or a replay-epoch change) means the
+        buffered event stream has gaps, so buffered ordering cannot prove whose
+        completion is whose; callers must recover through durable history.
+        """
+        with self._state_lock:
+            last_replay = self._last_replay
+        truncated = last_replay.get("truncated") if isinstance(last_replay, dict) else None
+        errors = last_replay.get("errors") if isinstance(last_replay, dict) else None
+        if isinstance(truncated, list) and session_id in truncated:
+            return True
+        if isinstance(errors, list) and errors:
+            return True
+        return bool(last_replay.get("epoch_changed")) if isinstance(last_replay, dict) else False
+
     def next_completion(self, session_id: str, *, after_seq: int = 0, timeout: float = 120.0) -> dict[str, Any] | None:
         """Wait for the next ``message.complete`` event after ``after_seq``.
 

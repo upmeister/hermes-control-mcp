@@ -79,7 +79,8 @@ class FakeGateway:
         self.turns: dict[str, dict] = {}
 
     def turn_state(self, session_id: str) -> dict:
-        return self.turns.setdefault(session_id, {"running": False, "inflight_user": None, "seq": 0})
+        return self.turns.setdefault(
+            session_id, {"running": False, "inflight_user": None, "seq": 0, "inflight_error": False})
 
     def emit_event(self, socket: FakeSocket, session_id: str, kind: str, payload: dict | None = None) -> int:
         state = self.turn_state(session_id)
@@ -101,6 +102,7 @@ class FakeGateway:
         # completion poll can legitimately observe running=true, inflight=None.
         state = self.turn_state(session_id)
         state["inflight_user"] = None
+        state["inflight_error"] = False
         self.history_rows.append({"role": "assistant", "text": "done", "row_id": len(self.history_rows) + 1})
         self.emit_event(socket, session_id, "message.complete", {"status": "complete", "text": "done"})
         asyncio.get_running_loop().call_later(0.05, self._end_turn, session_id)
@@ -147,10 +149,18 @@ class FakeGateway:
                 if self.inflight_enabled:
                     state = self.turn_state(frame["params"]["session_id"])
                     result["running"] = state["running"]
-                    if state["running"]:
-                        result["inflight"] = {
-                            "user": state["inflight_user"] or "", "assistant": "", "streaming": True,
+                    # Faithful to gateway _inflight_snapshot: the snapshot exists
+                    # only while a prompted turn is in flight; once the gateway
+                    # clears it (before emitting message.complete) the activate
+                    # payload omits "inflight" entirely.
+                    if state["inflight_user"] is not None:
+                        inflight = {
+                            "user": state["inflight_user"], "assistant": "", "streaming": True,
                         }
+                        if state.get("inflight_error"):
+                            inflight["error"] = "retained turn failure"
+                            inflight["status"] = "error"
+                        result["inflight"] = inflight
                 socket.push({"jsonrpc": "2.0", "id": rid, "result": result})
             elif method == "session.events.since":
                 self.replay_calls += 1
@@ -916,6 +926,91 @@ class LiveServiceTests(unittest.TestCase):
         self.assertEqual(waited["status"], "running")
         self.assertEqual(waited["error_code"], "wait_timeout")
         self.assertIsNone(waited.get("answer"))
+
+    def test_foreign_replacement_with_different_prompt_is_conservative(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        runtime = opened["session_id"]
+        service.prompt(
+            lane="coding", session_id=runtime, text="local question", request_id="live-replaced",
+        )
+        # A foreign turn with a DIFFERENT prompt replaces ours in the gateway
+        # state while a completion is already buffered; a conforming gateway
+        # never emits a turn's completion while its inflight snapshot is still
+        # live, so this ordering cannot attribute the candidate.
+        replaced = gateway.turn_state(runtime)
+        replaced["inflight_user"] = "foreign different prompt"
+        replaced["running"] = True
+        gateway.inject_foreign_turn(gateway.sockets[0], runtime, "foreign-answer")
+
+        waited = service.wait(request_id="live-replaced", timeout_seconds=0.5)
+
+        self.assertEqual(waited["status"], "unknown")
+        self.assertEqual(waited["error_code"], "completion_not_observed")
+        self.assertIsNone(waited.get("answer"))
+
+    def test_wait_after_truncated_replay_is_conservative(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        text = "gap survivor"
+        service.prompt(
+            lane="coding", session_id=opened["session_id"], text=text, request_id="live-gap",
+        )
+
+        # Same-epoch reconnect while the claimed turn still runs: the fresh
+        # inflight proof succeeds and a new cursor is established...
+        service.reconnect()
+        resumed = gateway.turn_state("runtime-resumed")
+        resumed["running"] = True
+        resumed["inflight_user"] = text
+        waited = service.wait(request_id="live-gap", timeout_seconds=0.3)
+        self.assertEqual(waited["status"], "running")
+
+        # ...but THIS connection's replay was truncated, so buffered ordering
+        # can no longer attribute any completion for the session, even one
+        # arriving after the re-proof.
+        assert service.client._last_replay is not None
+        service.client._last_replay = {
+            "replayed": 0, "truncated": ["runtime-resumed"], "errors": [], "epoch_changed": False,
+        }
+        resumed["running"] = False
+        resumed["inflight_user"] = None
+        gateway.emit_event(
+            gateway.sockets[-1], "runtime-resumed", "message.complete",
+            {"status": "complete", "text": "after-gap"},
+        )
+
+        waited = service.wait(request_id="live-gap", timeout_seconds=0.5)
+
+        self.assertEqual(waited["status"], "unknown")
+        self.assertEqual(waited["error_code"], "completion_not_observed")
+        self.assertIsNone(waited.get("answer"))
+
+    def test_failed_local_turn_completion_is_reported(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        runtime = opened["session_id"]
+        service.prompt(
+            lane="coding", session_id=runtime, text="failing turn", request_id="live-fail",
+        )
+        # The deployed gateway RETAINS a failed turn's inflight snapshot (with
+        # the error marker) while emitting the terminal completion.
+        failed = gateway.turn_state(runtime)
+        failed["inflight_error"] = True
+        gateway.emit_event(gateway.sockets[0], runtime, "message.complete",
+                           {"status": "error", "text": "", "error": "provider boom"})
+
+        waited = service.wait(request_id="live-fail", timeout_seconds=1)
+
+        self.assertEqual(waited["status"], "failed")
+        self.assertEqual(waited["error_code"], "live_turn_failed")
+        self.assertFalse(waited.get("answer"))
 
     def test_concurrent_same_request_id_submits_exactly_once(self):
         gateway = FakeGateway()

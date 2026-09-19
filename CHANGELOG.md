@@ -36,6 +36,16 @@ All notable user-facing changes to this local bridge are documented here.
   persists the re-proven cursor, or returns `completion_not_observed`.
 - Live `request_id` reservation is an atomic SQLite INSERT: concurrent calls
   with the same request_id can never submit two gateway mutations.
+- A live foreign-turn inflight snapshot (a prompt that is not the claimed one)
+  makes `live_wait` return `completion_not_observed` instead of accepting a
+  buffered completion; acceptance requires the inflight snapshot to be absent.
+  A retained FAILED-turn snapshot (the gateway keeps it, with an error marker,
+  while emitting the terminal completion) is recognized as the local failure
+  and reported as `failed`/`live_turn_failed`.
+- A truncated or errored replay for the session makes `live_wait` conservative
+  (`completion_not_observed`) regardless of a successful re-proof: buffered
+  ordering after event loss cannot attribute completions; durable recovery via
+  `live_reconcile`/`live_history` is required.
 - Registry gains additive, redacted live-request columns (`attribution`,
   `proof_seq`, `proof_epoch`, `inflight_sha256`, `boundary_row_id`,
   `boundary_count`); existing databases upgrade in place and legacy rows
