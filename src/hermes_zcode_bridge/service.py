@@ -506,12 +506,21 @@ class BridgeService:
                 set(self.registry.profiles_for_request_session(session_id))
                 | set(self.registry.profiles_for_session(session_id))
             )
-            if len(session_profiles) > 1 and profile is None:
-                return self._result(
-                    status="failed", error_code="lane_profile_ambiguous",
-                    error=(f"Session {session_id} appears under multiple profiles {session_profiles}; "
-                           "supply an explicit profile"),
-                )
+            if len(session_profiles) > 1:
+                if profile is None:
+                    return self._result(
+                        status="failed", error_code="lane_profile_ambiguous",
+                        error=(f"Session {session_id} appears under multiple profiles {session_profiles}; "
+                               "supply an explicit profile"),
+                    )
+                if profile not in session_profiles:
+                    # The exact ID/profile relationship is ambiguous locally;
+                    # an unrelated supplied profile must not create a reroute.
+                    return self._result(
+                        status="failed", error_code="request_profile_conflict",
+                        error=(f"Session {session_id} is locally bound under profiles {session_profiles}; "
+                               f"refusing to route it through unrelated profile {profile!r}"),
+                    )
             if len(session_profiles) == 1 and profile is not None and profile != session_profiles[0]:
                 return self._result(
                     status="failed", error_code="request_profile_conflict",
