@@ -83,7 +83,6 @@ Historical contract: [STAGE-2.2-IMPLEMENTATION-BRIEF.md](STAGE-2.2-IMPLEMENTATIO
 
 Completed outcomes:
 
-Goals:
 
 - make conservative live_wait outcomes that instruct the caller to reconcile
   actually transition into a state accepted by live_reconcile;
