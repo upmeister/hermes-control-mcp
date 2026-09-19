@@ -40,9 +40,18 @@ class StateRegistry:
                 session_id TEXT NOT NULL,
                 updated_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS lane_bindings (
+                profile TEXT NOT NULL,
+                lane TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(profile, lane)
+            );
+            CREATE INDEX IF NOT EXISTS lane_bindings_by_lane ON lane_bindings(lane);
             CREATE TABLE IF NOT EXISTS requests (
                 request_id TEXT PRIMARY KEY,
                 lane TEXT NOT NULL,
+                profile TEXT,
                 session_id TEXT,
                 run_id TEXT,
                 idempotency_key TEXT NOT NULL UNIQUE,
@@ -57,6 +66,7 @@ class StateRegistry:
             CREATE TABLE IF NOT EXISTS live_requests (
                 request_id TEXT PRIMARY KEY,
                 lane TEXT NOT NULL,
+                profile TEXT,
                 session_id TEXT NOT NULL,
                 prompt_sha256 TEXT NOT NULL,
                 fingerprint TEXT NOT NULL,
@@ -94,7 +104,33 @@ class StateRegistry:
             except sqlite3.OperationalError as exc:
                 if "duplicate column" not in str(exc).lower():
                     raise
-        self._conn.commit()
+        # Stage 2.2B additive profile identity: legacy rows become the default
+        # profile. The UPDATE backfills every pre-profile row exactly once;
+        # rows written after this migration always carry an explicit profile.
+        for table in ("requests", "live_requests"):
+            try:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN profile TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
+        with self._lock:
+            self._conn.execute(
+                "UPDATE requests SET profile='default' WHERE profile IS NULL"
+            )
+            self._conn.execute(
+                "UPDATE live_requests SET profile='default' WHERE profile IS NULL"
+            )
+            # Legacy lanes migrate into the profile-aware binding store under
+            # the default profile. INSERT OR IGNORE keeps the migration
+            # idempotent and never clobbers a binding rewritten after migration;
+            # no existing default lane is lost. The legacy lanes table is kept
+            # during 2.2B for rollback safety and receives only default-profile
+            # dual-writes.
+            self._conn.execute(
+                """INSERT OR IGNORE INTO lane_bindings(profile, lane, session_id, updated_at)
+                   SELECT 'default', lane, session_id, updated_at FROM lanes"""
+            )
+            self._conn.commit()
         self._tighten_permissions()
 
     def _tighten_permissions(self) -> None:
@@ -120,10 +156,60 @@ class StateRegistry:
             self._conn.commit()
             self._tighten_permissions()
 
+    def bind_profile_lane(self, profile: str, lane: str, session_id: str) -> None:
+        """Bind (profile, lane) -> session_id; legacy dual-write only for default.
+
+        Named-profile bindings must never collapse into the legacy global lane
+        key, so only ``default`` bindings are mirrored into the legacy lanes
+        table kept for 2.2B rollback safety.
+        """
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO lane_bindings(profile, lane, session_id, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(profile, lane) DO UPDATE SET
+                       session_id=excluded.session_id, updated_at=excluded.updated_at""",
+                (profile, lane, session_id, now),
+            )
+            if profile == "default":
+                self._conn.execute(
+                    """INSERT INTO lanes(lane, session_id, updated_at) VALUES (?, ?, ?)
+                       ON CONFLICT(lane) DO UPDATE SET session_id=excluded.session_id,
+                                                       updated_at=excluded.updated_at""",
+                    (lane, session_id, now),
+                )
+            self._conn.commit()
+            self._tighten_permissions()
+
     def session_for_lane(self, lane: str) -> str | None:
         with self._lock:
             row = self._conn.execute("SELECT session_id FROM lanes WHERE lane=?", (lane,)).fetchone()
         return str(row[0]) if row else None
+
+    def session_for_profile_lane(self, profile: str, lane: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT session_id FROM lane_bindings WHERE profile=? AND lane=?", (profile, lane)
+            ).fetchone()
+        return str(row[0]) if row else None
+
+    def profiles_for_lane(self, lane: str) -> list[str]:
+        """Distinct profiles with a binding for this lane, sorted for determinism."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT profile FROM lane_bindings WHERE lane=? ORDER BY profile", (lane,)
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def profiles_for_session(self, session_id: str) -> list[str]:
+        """Distinct profiles binding this stored session id, sorted for determinism."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT profile FROM lane_bindings WHERE session_id=? ORDER BY profile",
+                (session_id,),
+            ).fetchall()
+        return [str(row[0]) for row in rows]
 
     def save_request(
         self,
@@ -136,20 +222,22 @@ class StateRegistry:
         fingerprint: str,
         status: str,
         error_code: str | None = None,
+        profile: str = "default",
     ) -> None:
         now = time.time()
         with self._lock:
             self._conn.execute(
                 """INSERT INTO requests(
-                       request_id, lane, session_id, run_id, idempotency_key,
+                       request_id, lane, profile, session_id, run_id, idempotency_key,
                        fingerprint, status, error_code, created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(request_id) DO UPDATE SET
-                       lane=excluded.lane, session_id=excluded.session_id,
+                       lane=excluded.lane, profile=excluded.profile,
+                       session_id=excluded.session_id,
                        run_id=excluded.run_id, idempotency_key=excluded.idempotency_key,
                        fingerprint=excluded.fingerprint, status=excluded.status,
                        error_code=excluded.error_code, updated_at=excluded.updated_at""",
-                (request_id, lane, session_id, run_id, idempotency_key, fingerprint, status, error_code, now, now),
+                (request_id, lane, profile, session_id, run_id, idempotency_key, fingerprint, status, error_code, now, now),
             )
             self._conn.commit()
             self._tighten_permissions()
@@ -195,6 +283,35 @@ class StateRegistry:
             ).fetchone()
         return self._as_dict(row)
 
+    def latest_request_for_profile_lane(self, profile: str, lane: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT * FROM requests WHERE lane=? AND COALESCE(profile,'default')=?
+                   ORDER BY updated_at DESC LIMIT 1""",
+                (lane, profile),
+            ).fetchone()
+        return self._as_dict(row)
+
+    def request_profiles_for_lane(self, lane: str) -> list[str]:
+        """Distinct profiles among a lane's durable request rows, sorted."""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT DISTINCT COALESCE(profile,'default') AS p FROM requests
+                   WHERE lane=? ORDER BY p""",
+                (lane,),
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def profiles_for_request_session(self, session_id: str) -> list[str]:
+        """Distinct profiles among durable request rows for one session id, sorted."""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT DISTINCT COALESCE(profile,'default') AS p FROM requests
+                   WHERE session_id=? ORDER BY p""",
+                (session_id,),
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
     # ----- live request state --------------------------------------------
 
     def save_live_request(
@@ -216,19 +333,21 @@ class StateRegistry:
         inflight_sha256: str | None = None,
         boundary_row_id: int | None = None,
         boundary_count: int | None = None,
+        profile: str = "default",
     ) -> None:
         now = time.time()
         with self._lock:
             self._conn.execute(
                 """INSERT INTO live_requests(
-                       request_id, lane, session_id, prompt_sha256, fingerprint,
+                       request_id, lane, profile, session_id, prompt_sha256, fingerprint,
                        status, runtime_session_id, start_seq, error_code,
                        attribution, proof_seq, proof_epoch, proof_generation, inflight_sha256,
                        boundary_row_id, boundary_count,
                        created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(request_id) DO UPDATE SET
-                       lane=excluded.lane, session_id=excluded.session_id,
+                       lane=excluded.lane, profile=excluded.profile,
+                       session_id=excluded.session_id,
                        prompt_sha256=excluded.prompt_sha256, fingerprint=excluded.fingerprint,
                        status=excluded.status, runtime_session_id=excluded.runtime_session_id,
                        start_seq=excluded.start_seq, error_code=excluded.error_code,
@@ -238,7 +357,7 @@ class StateRegistry:
                        boundary_row_id=excluded.boundary_row_id,
                        boundary_count=excluded.boundary_count,
                        updated_at=excluded.updated_at""",
-                (request_id, lane, session_id, prompt_sha256, fingerprint,
+                (request_id, lane, profile, session_id, prompt_sha256, fingerprint,
                  status, runtime_session_id, start_seq, error_code,
                  attribution, proof_seq, proof_epoch, proof_generation, inflight_sha256,
                  boundary_row_id, boundary_count, now, now),
@@ -255,13 +374,14 @@ class StateRegistry:
         caller then reads the winner's record and replays or conflicts.
         """
         columns = (
-            "request_id", "lane", "session_id", "prompt_sha256", "fingerprint",
+            "request_id", "lane", "profile", "session_id", "prompt_sha256", "fingerprint",
             "status", "runtime_session_id", "start_seq", "error_code",
             "attribution", "proof_seq", "proof_epoch", "proof_generation", "inflight_sha256",
             "boundary_row_id", "boundary_count", "created_at", "updated_at",
         )
         values = (
-            record.get("request_id"), record.get("lane"), record.get("session_id"),
+            record.get("request_id"), record.get("lane"), record.get("profile") or "default",
+            record.get("session_id"),
             record.get("prompt_sha256"), record.get("fingerprint"), record.get("status"),
             record.get("runtime_session_id"), record.get("start_seq"), record.get("error_code"),
             record.get("attribution"), record.get("proof_seq"), record.get("proof_epoch"),
@@ -329,6 +449,34 @@ class StateRegistry:
                 "SELECT * FROM live_requests WHERE lane=? ORDER BY updated_at DESC LIMIT 1", (lane,)
             ).fetchone()
         return self._as_dict(row)
+
+    def latest_live_request_for_profile_lane(self, profile: str, lane: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT * FROM live_requests WHERE lane=? AND COALESCE(profile,'default')=?
+                   ORDER BY updated_at DESC LIMIT 1""",
+                (lane, profile),
+            ).fetchone()
+        return self._as_dict(row)
+
+    def live_request_profiles_for_lane(self, lane: str) -> list[str]:
+        """Distinct profiles among a lane's live request rows, sorted."""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT DISTINCT COALESCE(profile,'default') AS p FROM live_requests
+                   WHERE lane=? ORDER BY p""",
+                (lane,),
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def live_requests_for_profile_lane(self, profile: str, lane: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM live_requests WHERE lane=? AND COALESCE(profile,'default')=?
+                   ORDER BY updated_at DESC""",
+                (lane, profile),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def live_requests_for_lane(self, lane: str) -> list[dict[str, Any]]:
         with self._lock:
