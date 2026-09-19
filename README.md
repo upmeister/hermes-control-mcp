@@ -1,306 +1,273 @@
 # hermes-zcode-bridge
 
-Тонкий MCP stdio bridge для ZCode → Hermes Agent API Server и live TUI gateway.
-Он не добавляет новый UI: ZCode запускает один долгоживущий MCP процесс, bridge
-использует durable `/v1/runs` и планируемый cooperative local attach к тому же
-Hermes Desktop/TUI runtime. ChatGPT/OpenAI Tunnel и Dashboard web-token не входят
-в текущую архитектуру.
+An experimental MCP control plane for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
-## Что решает Stage 1 и Stage 2
+The project started as a ZCode integration, but the bridge itself is an MCP stdio server and is intentionally moving toward a client-neutral public package. It exposes two complementary control planes:
 
-Текущий SSH+`hermes chat --oneshot` создаёт новый CLI/runtime path на каждый
-prompt. Здесь процессная схема другая:
+- **Durable runs** over the Hermes API Server for idempotent, detachable work.
+- **Live shared sessions** for attaching to the same Hermes TUI/Desktop runtime without creating a second session authority.
 
-```text
-ZCode MCP client
-    │ one stdio connection (optionally one SSH process)
-    ▼
-ssh example-host → scripts/run-bridge.sh → hermes-zcode-bridge
-                                      │ localhost HTTP + Bearer auth
-                                      ▼
-                              Hermes API Server :8642
-                                      │
-                                      ▼
-                       durable run + Hermes session history
-```
+> **Project status:** Stage 2.1 is deployed and in active use. The merged Stage 2.1 hardening PR completed with 71 tests green. The project is not public-release-ready yet: live owner attach currently depends on an out-of-tree Hermes owner-adapter seam, multi-profile routing is only partially modeled, and packaging/security ergonomics still need a public-beta pass.
 
-Stage 2 добавляет общий живой leg, не меняя этот Stage1 fallback:
+## Why this exists
 
-```text
-ZCode MCP stdio ──SSH──> bridge ──cooperative local attach──> owner TUI gateway
-                                                               │
-                                                               ├─ Hermes Desktop
-                                                               └─ dashboard/TUI clients
-```
+Hermes already exposes several useful programmatic surfaces, but they have different lifecycle semantics.
 
-Цель — оба клиента остаются attached к одному Hermes runtime. `session.resume`
-не забирает live lease: текущий Hermes `tui_gateway` fan-out'ит events всем
-attached clients. Stage 2 implementation реализует local attach как явный
-opt-in через private owner lease; production enablement остаётся отдельным gate.
+The API Server is a good fit for durable jobs: start a run, disconnect, reconnect later, inspect status, and rely on idempotency. The TUI gateway is a better fit when an external coding agent needs to participate in the **same live conversation** a human sees in Hermes Desktop/TUI.
 
-Bridge хранит в локальной SQLite только:
+This bridge keeps those two modes explicit instead of pretending they are interchangeable.
 
-- `lane → session_id`;
-- `request_id → run_id/session_id/status`;
-- fingerprint запроса и `Idempotency-Key`;
-- error code и timestamps.
+~~~text
+MCP client
+   |
+   | stdio (locally or over SSH)
+   v
+hermes-zcode-bridge
+   |
+   +-- durable plane --> Hermes API Server --> /v1/runs, history, status, control
+   |
+   +-- live plane ----> private owner attach --> existing TUI gateway runtime
+                                             --> same live session as Desktop/TUI
+~~~
 
-Raw prompt, bearer token и response body в registry не записываются. Ответы и
-история остаются на стороне Hermes API Server.
+The bridge is deliberately thin: it does not embed Hermes core, create a second agent runtime, expose raw gateway dispatch, or silently retry ambiguous mutations.
 
-## Инструменты MCP
+## Current capabilities
 
-MCP host увидит следующие tools (обычно с префиксом имени MCP server):
+### Durable plane
 
-- `run_start` — старт durable run; принимает `lane`, `prompt`, optional exact
-  `session_id`, `model`, `provider`, `instructions`, `request_id`;
-- `run_status` — status/answer/error для exact `run_id` или latest request lane;
-- `run_wait` — bounded polling до terminal status;
-- `run_events` — получить сохранённый SSE event stream, если он ещё доступен;
-- `run_stop` — cooperative stop exact run;
-- `run_steer` — course correction exact running run;
-- `session_history` — bounded oldest-first history exact session;
-- `bridge_health` — `/health`, `/v1/models`, `/v1/capabilities`, без LLM turn.
+- idempotent run submission with caller request IDs;
+- explicit lane-to-session continuity;
+- bounded status/wait/event collection;
+- exact-run stop and steer;
+- durable session history;
+- structured recovery after uncertain transport outcomes;
+- Hermes health/models/capabilities probes.
 
-Stage 2 live tools:
+Primary MCP tools:
 
-- `live_session_open` — открыть или resume одну lane через configured cooperative local attach к owner TUI gateway (через отдельный private owner route, не Dashboard `/api/ws`); результат
-  содержит `session_id` (runtime identity) и `stored_session_id` (durable identity). Аргумент
-  `session_id` здесь — stored/durable ID;
-- `live_prompt` — отправить prompt в существующий TUI session; переносы строк и
-  tab сохраняются буквально; `wait_seconds` опционально ждёт terminal event;
-  при явном `session_id` это runtime ID, поэтому для обычного потока предпочитай `lane`;
-- `live_wait` — дождаться completion текущего live prompt. Владение ходом доказывается через
-  gateway-side inflight evidence (`session.activate`): ход другого attached клиента с другим
-  prompt не возвращается как ответ локального запроса. Если доказать владение нельзя (queued
-  submit, отсутствие inflight evidence, degraded replay — усечение/ошибка replay или смена
-  replay epoch) — `live_wait` возвращает консервативный `ambiguous_turn` /
-  `completion_not_observed` вместо возможного чужого ответа. Фундаментальное исключение
-  описано в known limitation ниже: байт-в-байт одинаковый prompt другого writer'а
-  неразличим, и его completion в terminal window МОЖЕТ быть возвращён как локальный ответ;
-- `live_events` — прочитать bounded in-memory event buffer после `after_seq`;
-  при явном `session_id` это runtime ID, поэтому предпочитай `lane`;
-- `live_status` / `live_history` — recovery reads; при явном `session_id` ожидают
-  runtime ID, для стабильного доступа используй `lane`;
-- `live_steer` / `live_interrupt` — exact-session controls; явный `session_id`
-  также является runtime ID, поэтому предпочитай `lane`;
-- `live_reconcile` — проверить неизвестный submit по durable history, не повторяя его. Перед
-  submit фиксируется redacted pre-submit boundary (max user `row_id`); после submit
-  кандидаты матчатся только строго после boundary. Старый идентичный prompt не может
-  рекомсилить новый submit; несколько одинаковых post-boundary строк дают консервативный
-  `ambiguous_history_match`; строки без boundary metadata не рекомсятся никогда;
-- `live_reconnect` — новый WS generation + replay retained events;
-- `live_health` — auth/connection/replay/buffer health без LLM turn.
+~~~text
+run_start
+run_status
+run_wait
+run_events
+run_stop
+run_steer
+session_history
+bridge_health
+~~~
 
-Все tools возвращают JSON envelope:
+### Live plane
 
-```json
-{
-  "ok": true,
-  "request_id": "req_example",
-  "run_id": "run_...",
-  "session_id": "session-...",
-  "status": "completed",
-  "answer": "...",
-  "error_code": null,
-  "error": null,
-  "replayed": false,
-  "artifact_refs": [],
-  "commit_refs": []
-}
-```
+- create or resume a Hermes live session;
+- attach to an existing owner runtime rather than spawning a competing one;
+- submit prompts without blind retry;
+- bounded completion waiting with shared-session attribution checks;
+- event replay and reconnect handling;
+- live status/history;
+- steer and interrupt;
+- durable-history reconciliation after ambiguous submit/stream outcomes.
 
-## Безопасная retry-механика
+Primary MCP tools:
 
-1. Новый `run_start` получает caller `request_id` (или bridge генерирует его) и
-   один `Idempotency-Key`.
-2. Если HTTP acknowledgement потерян, результат помечается `unknown`; bridge
-   не создаёт новый key и не повторяет POST сам.
-3. Явный повтор того же `request_id` с тем же prompt/fingerprint использует
-   прежний key. Hermes API Server возвращает исходный `run_id` либо bridge
-   позволяет опросить уже известный run.
-4. Другой prompt под тем же request ID или попытка незаметно сменить session
-   lane получает структурированный conflict.
-5. Provider/model передаются только явно указанными значениями; bridge не
-   нормализует alias и не делает silent fallback.
+~~~text
+live_session_open
+live_prompt
+live_wait
+live_events
+live_status
+live_history
+live_steer
+live_interrupt
+live_reconcile
+live_reconnect
+live_health
+~~~
 
-`run_status` после disconnect/restart является recovery authority. SSE — это
-наблюдение, а не замена status reconciliation.
+## Identity model
 
-Для live `prompt.submit` acknowledgement без ответа помечается
-`status: "unknown", error_code: "transport_unknown"`. Bridge не отправляет
-такой prompt повторно — даже после перезапуска MCP процесса. Сначала вызывается
-`live_reconcile`: boundary-aware history match является evidence, но одинаковые
-post-boundary prompts, которые нельзя различить, остаются консервативно `unknown`.
+Several identifiers that look similar are intentionally kept separate:
 
-Атрибуция completion в shared runtime: запрос с ack `streaming` доказывает владение
-текущим ходом через inflight snapshot (SHA-256 stripped prompt text); ack `queued` не
-доказывается и остаётся консервативным. Байт-в-байт одинаковые prompts от двух writers в
-одной session остаются фундаментальным ограничением протокола Hermes (нет server-issued
-turn/admission ID, upstream U2). Конкретный небезопасный исход этого known limitation:
-если локальный ход завершился, а другой writer в terminal window (или в окне потери
-событий при reconnect) успел отправить байт-в-байт тот же prompt, приём completion может
-вернуть ответ ЧУЖОГО хода как ответ локального запроса. Bridge устраняет все устранимые
-варианты этого класса, но сам класс неустраним без upstream turn-identity seam.
+- **profile** — Hermes configuration/state/memory boundary;
+- **lane** — bridge-side stable routing name;
+- **stored session ID** — durable Hermes conversation identity;
+- **runtime session ID** — ephemeral ID owned by one live TUI gateway process;
+- **run ID** — one durable API execution;
+- **request ID** — caller-side logical request identity;
+- **connection generation / replay epoch / event sequence** — live transport evidence.
 
-Дополнительные conservative-правила `live_wait`: живой чужой ход в inflight-снапшоте
-делает результат консервативным (`completion_not_observed`); приём completion требует
-отсутствия inflight-снапшота; retained failed-turn снапшот принимается только с terminal
-error-кандидатом (success payload под retained failure — консервативный), а упавший ход
-никогда не возвращает `answer` — fallback-текст gateway error-payload попадает в `error`,
-не в ответ; reconnect, произошедший ВО ВРЕМЯ блокирующего `live_wait`, инвалидирует proof —
-wait перепроверяет connection generation и replay epoch перед приёмом любого кандидата;
-truncated/ошибочный replay ИЛИ смена replay epoch (ротация runtime очищает буфер — то же
-окно потери событий) переводят `live_wait` в консервативный режим даже при успешном
-re-proof, и маркер деградации переживает ротацию runtime id; продолжать ожидание после
-re-proof можно только после чистого same-epoch reconnect с полным replay (durable
-recovery через `live_reconcile`/`live_history`).
+For live calls, prefer the bridge lane after opening a session. Runtime session IDs are ephemeral and must not be treated as durable handles.
 
-## Подключение ZCode через SSH
+## Safety and recovery rules
 
-Скопированный/установленный на сервере checkout можно подключить как обычный
-MCP stdio service. Для Stage 2 используй private owner lease, а не Dashboard
-credentials или публичный `/api/ws`:
+The bridge is conservative by design.
 
-```json
+- A mutating request with an uncertain acknowledgement is **not** silently resubmitted.
+- One logical durable request keeps one idempotency key.
+- Live completions are not accepted solely because they are the next event in a buffer.
+- Reconnects invalidate live ownership proofs.
+- Replay gaps and epoch changes fail closed into recovery rather than guessing.
+- The bridge registry stores IDs, hashes, cursors, status and routing metadata — not raw prompts or credentials.
+- MCP tools are an allowlist. Raw shell, arbitrary gateway RPC, slash commands and configuration mutation are not exposed.
+
+Stage 2.1 still has one upstream-limited attribution edge: the current TUI prompt protocol does not provide a general server-issued turn/admission identity for ordinary prompt submission. Byte-identical competing prompts can therefore remain fundamentally indistinguishable in a narrow terminal/reconnect window. See [Upstream research](docs/UPSTREAM-HERMES.md).
+
+## Live owner attach
+
+The preferred live deployment uses a private, same-user local owner boundary:
+
+~~~text
+Hermes owner process
+  |
+  +-- existing TUI gateway/session registry
+  |
+  +-- private Unix-domain socket
+        |
+        +-- owner lease + PID/process/profile fencing
+              |
+              +-- bridge WebSocket client
+~~~
+
+The bridge does **not** reuse Dashboard cookies, browser refresh tokens, public WebSocket credentials, or the API Server key for this path.
+
+The current owner adapter is an out-of-tree Hermes integration and remains opt-in/default-disabled. The long-term goal is to converge on a supported upstream machine/native attach seam rather than permanently maintaining a private transport fork. See [ADR-0001](docs/adr/0001-local-owner-attach.md) and [Upstream research](docs/UPSTREAM-HERMES.md).
+
+## Running from source
+
+Python 3.11+ is required.
+
+~~~bash
+git clone https://github.com/upmeister/hermes-zcode-bridge.git
+cd hermes-zcode-bridge
+
+python -m venv .venv
+. .venv/bin/activate
+pip install -e .
+~~~
+
+The package exposes:
+
+~~~bash
+hermes-zcode-bridge --help
+~~~
+
+A typical stdio MCP client launches the bridge as a long-lived process. If Hermes runs on another machine, SSH can wrap the process once for the lifetime of the MCP connection:
+
+~~~json
 {
   "mcpServers": {
-    "hermes_stage2": {
+    "hermes": {
       "command": "ssh",
       "args": [
         "-T",
-        "example-host",
-        "/path/to/hermes-control-mcp/scripts/run-bridge.sh",
-        "--gateway-owner-lease",
-        "/path/to/owner_adapter.json",
+        "hermes-host",
+        "/path/to/hermes-zcode-bridge/.venv/bin/hermes-zcode-bridge",
         "--state-db",
-        "/path/to/bridge-state.db",
-        "--log-level",
-        "WARNING"
-      ],
-      "timeout": 180,
-      "connect_timeout": 30
+        "~/.local/state/hermes-zcode-bridge/bridge.db"
+      ]
     }
   }
 }
-```
+~~~
 
-`ssh` и bridge живут столько, сколько MCP connection ZCode. Поэтому SSH
-handshake и Python/Hermes startup происходят один раз на MCP session, а не на
-каждый prompt. При reconnect ZCode создаёт новый процесс; registry и API
-idempotency позволяют безопасно продолжить работу.
+Secrets should stay on the Hermes host. Do not place API keys, Dashboard credentials, owner identity material, or bearer tokens in client configuration.
 
-Эта конфигурация запускает durable MCP lane без Dashboard credentials. Для
-opt-in local attach bridge принимает явный путь lease:
+Live owner attach additionally requires a compatible owner-adapter lease:
 
-```bash
-python -m hermes_zcode_bridge.server --gateway-owner-lease \
-  "$HERMES_HOME/runtime/owner_adapter/owner_adapter.json"
-```
+~~~bash
+hermes-zcode-bridge \
+  --gateway-owner-lease "$HERMES_HOME/runtime/owner_adapter/owner_adapter.json"
+~~~
 
-Owner-side gate `dashboard.owner_adapter.enabled` по умолчанию выключен.
-Ни web-token, ни
-`HERMES_DASHBOARD_ACCESS_TOKEN`, ни `HERMES_DASHBOARD_REFRESH_TOKEN` в ZCode args
-или текущем deployment contract не нужны.
+This is currently an integration/development setup, not yet the recommended public installation path.
 
-`run-bridge.sh` выбирает Hermes venv, если он есть, добавляет `src` в
-`PYTHONPATH` и передаёт управление `python -m hermes_zcode_bridge.server`.
-API key берётся из `API_SERVER_KEY` в окружении или server-side
-`$HERMES_HOME/.env`. Key не должен появляться в ZCode args, URL, git или logs.
+## Tests
 
-## Локальный запуск и тесты
-
-```bash
+~~~bash
 ./scripts/test.sh
-PYTHONPATH=src python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -v
 python3 -m compileall -q src
+python3 -m py_compile src/hermes_zcode_bridge/*.py
+~~~
 
-# Только parser/entrypoint без API key и LLM:
-./scripts/run-bridge.sh --help
-```
+The project uses deterministic fake transports for most protocol tests plus real WebSocket/UDS smoke coverage where transport behavior matters.
 
-Тесты используют fake transport и локальный fake HTTP server. Они проверяют
-MCP initialize/tools/list/tools/call, explicit session/provider, lane binding,
-request fingerprint, same-key reconciliation after timeout, exact stop/steer,
-wait, SSE parsing, history, error redaction, persistent TUI WS, event replay,
-seq-gap race, ticket/refresh rotation и отсутствие secret в stderr. Настоящий `websockets 15.0.1` smoke для private UDS owner surface и
-bridge→owner attach прошёл; disposable existing-session fixture также прошёл
-с `session.resume`, `session.activate`, сохранением исходного Desktop-like
-клиента и двумя bridge WS generations. Полный bridge suite: 47 тестов green;
-LLM-turn smoke намеренно не запускался.
+## Roadmap
 
-## API Server activation
+### Completed
 
-На текущем сервере Stage 1 activation уже применена и проверена: API Server
-слушает только `127.0.0.1:8642`, gateway active, authenticated health/models/
-capabilities probes проходят. Для другой установки применяй конфигурацию ниже.
+- **Stage 1** — durable MCP control plane over the Hermes Runs API.
+- **Stage 2** — private owner attach to an existing live Hermes TUI runtime.
+- **Stage 2.1** — shared-turn attribution hardening, replay conservatism, boundary-aware reconciliation, and atomic live request reservation.
 
-Перед включением нужно добавить в server-side Hermes `.env`:
+### Next: Stage 2.2 — public-beta foundation
 
-```text
-API_SERVER_ENABLED=true
-API_SERVER_HOST=127.0.0.1
-API_SERVER_PORT=8642
-API_SERVER_KEY=[REDACTED]
-```
+Stage 2.2 is intentionally split into bounded PRs:
 
-Настоящее значение key уже должно существовать только в protected env store;
-не копируйте placeholder из этого README. После изменения `.env` требуется
-штатный restart/reload gateway с read-back `/health`, `/v1/models` и
-`/v1/capabilities`. Gateway restart может прервать текущие Telegram sessions;
-это отдельная operational action, не часть fake tests.
+1. **Lifecycle recovery** — close conservative wait → reconciliation gaps and handle Hermes' transient "session no longer live; retry resume" race without masking genuine missing sessions.
+2. **First-class multi-profile routing** — make profile part of durable lane identity, preserve it across restart/resume, and route durable API requests through Hermes `/p/<profile>/...` with profile-scoped credentials.
+3. **Public packaging/hardening** — client-neutral naming/docs, clean-install smoke, CI/release metadata, registry schema ownership and generic examples.
 
-Для ZCode с SSH достаточно loopback bind. Не публикуйте `:8642` наружу и не
-передавайте key в URL. Если позже понадобится Tailscale bind, это отдельное
-решение с auth/firewall preflight.
+Research gates run alongside implementation:
 
-### Stage 2 live access — owner adapter (opt-in; disabled by default)
+- compare `/v1/runs` with Hermes' newer Agent Sessions API;
+- track upstream unified-session work and native/machine-client authorization;
+- avoid building a competing cross-platform IPC layer while upstream is actively converging on one.
 
-Owner surface использует отдельный route `/api/owner/ws` на private Unix
-socket, подключённый к тому же uvicorn/event loop и `tui_gateway`, что и
-обычный Hermes runtime. Это не второй Hermes runtime и не переиспользование
-Dashboard `/api/ws`.
+Detailed plan: [ROADMAP.md](docs/ROADMAP.md).
 
-Lease содержит только runtime/profile/process identity и endpoint metadata:
-`runtime_id`, PID, process-start marker, `profile_home`, socket/lease paths,
-route и protocol version. Owner route дополнительно проверяет UDS scope,
-private permissions, неизменённый lease и живой PID/start marker. Bridge
-проверяет lease/socket identity и передаёт только identity query; token/ticket
-из lease или Dashboard config не копируются.
+## Hermes upstream watch
 
-Подтверждено в disposable process fixture: публикация lease, UDS handshake,
-`gateway.ready`, `gateway.ping`, rejection wrong identity/TCP bypass, cleanup,
-existing-session resume/activate, rebind и reconnect. Owner adapter gate
-остаётся выключенным по умолчанию; production service не перезапускался.
+Hermes is moving quickly in exactly the areas this bridge depends on. As of the 2026-09-20 research snapshot:
 
-Предпочтительная граница — Unix socket с filesystem permissions, owner lease,
-PID/liveness и profile fencing. Loopback HTTP допустим только если тот же набор
-проверок закрывает admission boundary. `auth_required=false`, legacy `?token=`
-и использование `internal_ws_credential` из независимого bridge запрещены.
+- the stable release is v0.21.3 / v2026.9.14;
+- the API Server supports a richer Agent Sessions API, including session chat and SSE streaming;
+- multiplexed profiles are served through `/p/<profile>/...` with profile-scoped authentication;
+- upstream PR #106742 proposes one gateway-owned session authority across local surfaces, including durable admission identity and multi-profile ownership;
+- issue #109891 discusses making that gateway a first-class Desktop backend;
+- issue #62857 proposes scoped native WebSocket grants.
 
-После `gateway.ready` bridge отправляет `client.capabilities` с
-`server_requests=false`: bridge не является интерактивным approval/clarify
-клиентом и не должен перехватывать server→client requests у Desktop.
+These are inputs to our architecture, not dependencies we pretend are already merged. See [UPSTREAM-HERMES.md](docs/UPSTREAM-HERMES.md).
 
-## Границы Stage 1
+## Distribution direction
 
-API run process и Hermes Desktop `hermes serve` — разные runtime/transport
-процессы. Stage 1 даёт durable job lane, status, recovery и control. Stage 2
-transport/replay core; Stage 2 implementation добавляет доказанный local
-cooperative attach вторым client к существующему owner runtime без web token.
-Security/integration review для этого scope получил GO; production
-concurrency/LLM smoke и owner enablement остаются отдельными opt-in gates.
-A2A, peer/Bot Chat и public package release пока backlog.
+The likely public distribution model is:
 
-Issue `#94017` про повторный provider resolution persisted session остаётся
-отдельным Hermes risk. Перед использованием named `custom:*` provider нужно
-проверить актуальный upstream workaround/merge; этот bridge не подменяет
-provider identity и не скрывает ошибки.
+1. **Primary:** standalone Python package, runnable directly or through `uvx`/an equivalent isolated package runner.
+2. **Optional:** a Hermes plugin companion that improves installation, discovery, configuration or owner-seam integration.
+3. **Upstream:** contribute the smallest generally useful Hermes core seams instead of permanently carrying a private fork.
 
-## Rollback
+Hermes plugins can be distributed through Git/Python entry points and support an external-runtime/sidecar pattern, so a plugin wrapper is technically possible. However, the bridge is an **external MCP server whose lifetime is owned by the MCP client**; forcing that runtime inside Hermes would blur an otherwise useful process boundary.
 
-Удалить MCP entry из ZCode config и закрыть stdio process достаточно для
-отката клиентского канала. Registry можно оставить для последующего resume;
-если его нужно убрать, удаляется только локальный
-`~/.local/state/hermes-zcode-bridge/bridge.db` после проверки, что active runs
-уже reconciled через API. Hermes sessions/API Server bridge code не удаляет.
+The full rationale and an upstreaming proposal are documented in [DISTRIBUTION-AND-UPSTREAMING.md](docs/DISTRIBUTION-AND-UPSTREAMING.md).
+
+## Should this eventually live in Hermes itself?
+
+Possibly — but not as the first move.
+
+The strongest near-term upstream contribution is the generic Hermes-side contract the bridge needs: supported machine/native attach, stable session/admission identity, profile-scoped routing, and capability-limited authorization. Those benefit Hermes independently of this MCP client.
+
+After the bridge has a public beta and the upstream session-authority direction settles, there is a reasonable case for proposing either:
+
+- a bundled `hermes mcp` integration;
+- an official Hermes plugin/package;
+- or moving the bridge itself into the Hermes repository if maintainers want MCP as a supported external control-plane surface.
+
+Until then, keeping the bridge standalone lets it iterate quickly without coupling its release cadence to Hermes core.
+
+## Documentation
+
+- [Stage 2.2 roadmap](docs/ROADMAP.md)
+- [Next coding PR implementation brief](docs/STAGE-2.2-IMPLEMENTATION-BRIEF.md)
+- [Hermes upstream research](docs/UPSTREAM-HERMES.md)
+- [API Server / Agent Sessions parity spike](docs/API-SERVER-PARITY-SPIKE.md)
+- [Distribution and upstreaming strategy](docs/DISTRIBUTION-AND-UPSTREAMING.md)
+- [ADR-0001: private owner attach](docs/adr/0001-local-owner-attach.md)
+
+## Development contract
+
+Read [AGENTS.md](AGENTS.md) before changing behavior. It defines the current scope, safety invariants and required checks.
+
+## License and public release
+
+A public release still needs an explicit license decision and release metadata. Until that is done, treat this repository as pre-public engineering work rather than a finished third-party distribution.
