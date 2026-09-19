@@ -78,6 +78,9 @@ class FakeGateway:
         # When set, session.events.since responses report truncated=True so the
         # client's real replay path records the degradation marker itself.
         self.truncated_replay = False
+        # When set, these retained events are replayed verbatim by
+        # session.events.since on the next (re)connect.
+        self.replay_events: list[dict] = []
         self.history_rows: list[dict] = []
         self.turns: dict[str, dict] = {}
 
@@ -187,12 +190,14 @@ class FakeGateway:
                         },
                     })
                 else:
+                    replayed_events = list(self.replay_events)
+                    latest = max([e["seq"] for e in replayed_events], default=1)
                     socket.push({
                         "jsonrpc": "2.0", "id": rid,
-                        "result": {"session_id": frame["params"]["session_id"], "events": [],
-                                   "latest_seq": 1, "truncated": self.truncated_replay,
-                                   "epoch": self.epoch,
-                                   "count": 0, "open_requests": []},
+                        "result": {"session_id": frame["params"]["session_id"], "events": replayed_events,
+                                   "latest_seq": latest, "truncated": self.truncated_replay,
+                                   "epoch": self.epoch, "count": len(replayed_events),
+                                   "open_requests": []},
                     })
             elif method == "prompt.submit":
                 self.prompt_calls += 1
@@ -1040,6 +1045,67 @@ class LiveServiceTests(unittest.TestCase):
                            {"status": "complete", "text": "foreign-success"})
 
         waited = service.wait(request_id="live-fail-inject", timeout_seconds=0.5)
+
+        self.assertEqual(waited["status"], "unknown")
+        self.assertEqual(waited["error_code"], "completion_not_observed")
+        self.assertIsNone(waited.get("answer"))
+
+    def test_failed_turn_error_text_is_not_returned_as_answer(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        runtime = opened["session_id"]
+        service.prompt(
+            lane="coding", session_id=runtime, text="failing turn", request_id="live-fail-text",
+        )
+        # The deployed gateway's terminal error payload carries fallback
+        # failure copy in `text` (prompt_turn._complete_turn_payload sets
+        # payload["error"] = str(error_value or raw) alongside it): that text
+        # is failure detail, never the turn's answer.
+        failed = gateway.turn_state(runtime)
+        failed["inflight_error"] = True
+        gateway.emit_event(gateway.sockets[0], runtime, "message.complete",
+                           {"status": "error", "text": "gateway failure explanation",
+                            "error": "provider boom"})
+
+        waited = service.wait(request_id="live-fail-text", timeout_seconds=1)
+
+        self.assertEqual(waited["status"], "failed")
+        self.assertEqual(waited["error_code"], "live_turn_failed")
+        self.assertEqual(waited.get("error"), "provider boom")
+        self.assertIsNone(waited.get("answer"))
+
+    def test_reconnect_during_wait_is_conservative(self):
+        gateway = FakeGateway()
+        gateway.complete_delay = None
+        service, _ = self.make_service(gateway)
+        opened = service.open(lane="coding")
+        runtime = opened["session_id"]
+        service.prompt(
+            lane="coding", session_id=runtime, text="overlap probe", request_id="live-overlap",
+        )
+        # Deterministic scheduling probe: the claimed turn ends while the wait
+        # is blocked, a foreign completion is retained by the gateway, and
+        # live_reconnect overlaps the wait — the replayed candidate arrives on
+        # a NEW connection generation, so the stale proof must not admit it.
+        gateway.replay_events = [{
+            "type": "message.complete", "session_id": runtime, "seq": 2,
+            "payload": {"status": "complete", "text": "foreign-after-reconnect"},
+        }]
+        ended = gateway.turn_state(runtime)
+        ended["running"] = False
+        ended["inflight_user"] = None
+
+        real_next = service.client.next_completion
+
+        def reconnect_during_wait(session_id, *, after_seq, timeout):
+            service.reconnect()
+            return real_next(session_id, after_seq=after_seq, timeout=timeout)
+
+        service.client.next_completion = reconnect_during_wait
+
+        waited = service.wait(request_id="live-overlap", timeout_seconds=1.0)
 
         self.assertEqual(waited["status"], "unknown")
         self.assertEqual(waited["error_code"], "completion_not_observed")

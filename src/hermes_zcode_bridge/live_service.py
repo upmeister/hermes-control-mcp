@@ -506,6 +506,21 @@ class LiveService:
                     error="Live prompt is still active; call live_wait or live_events again",
                     attribution=attribution,
                 )
+            if (
+                self.client.connection_generation() != current_generation
+                or self.client.health().get("replay_epoch") != current_epoch
+            ):
+                # A reconnect (or epoch rotation) happened while this wait was
+                # blocked. The proof watermark belongs to the previous
+                # connection, so no buffered candidate is admissible anymore,
+                # regardless of the gateway-side snapshot.
+                return self._result(
+                    status="unknown", request_id=request_id, session_id=runtime, stored_session_id=stored,
+                    error_code="completion_not_observed", replayed=True,
+                    error=("The live connection was re-established during the wait; buffered ordering "
+                           "cannot attribute completions. Use live_reconcile/live_history for durable recovery."),
+                    attribution=attribution,
+                )
             if self.client.events_truncated(runtime, after_seq=cursor):
                 # The ring evicted events between the proof cursor and here, so
                 # buffer order no longer proves whose completion this is.
@@ -588,10 +603,18 @@ class LiveService:
             # local completion.
             status = {"complete": "completed", "error": "failed", "cancelled": "interrupted"}.get(raw_status, raw_status)
             error_code = "live_turn_failed" if status == "failed" else None
+            # A failed or interrupted turn has no answer: the gateway's
+            # terminal error payload carries fallback failure copy in `text`
+            # (prompt_turn._complete_turn_payload mirrors it into `error` as
+            # str(error_value or raw)), which is failure detail, never the
+            # turn's answer.
+            answer = payload.get("text") if isinstance(payload.get("text"), str) else None
+            if status != "completed":
+                answer = None
             self.registry.update_live_request(request_id, status=status, error_code=error_code)
             return self._result(
                 status=status, request_id=request_id, session_id=runtime,
-                stored_session_id=stored, answer=payload.get("text") if isinstance(payload.get("text"), str) else None,
+                stored_session_id=stored, answer=answer,
                 error_code=error_code, error=str(payload.get("error")) if payload.get("error") else None,
                 event=event, event_seq=event.get("seq"), attribution=attribution,
             )
