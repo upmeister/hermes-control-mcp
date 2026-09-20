@@ -167,10 +167,17 @@ Supported Python versions for the public beta:
 3.11
 3.12
 3.13
+3.14
 ~~~
 
-CI builds wheel + sdist and installs the wheel into a fresh virtual environment
-before running an MCP stdio smoke test.
+CI covers Python 3.11–3.14 and builds wheel + sdist. Clean installed-wheel MCP
+smokes run on both Python 3.11 and 3.14.
+
+On PEP 668 distributions, global/system `pip install` may be blocked with
+`externally-managed-environment`. This is expected operating-system package
+management behavior. Install the CLI through an isolated tool environment
+(`uv tool` / `pipx`) or a virtual environment instead of bypassing the
+system guard.
 
 ## Upstream policy
 
