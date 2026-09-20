@@ -148,8 +148,20 @@ def run_doctor(
     if api_client is not None:
         for profile in requested:
             key_present = bool(named_profile_api_key(profile, config.resolved_profiles_root()))
+            if not key_present:
+                profile_reports[profile] = {
+                    "ok": False,
+                    "status": "failed",
+                    "error_code": "profile_key_unavailable",
+                    "error": (
+                        f"Named profile {profile!r} has no API_SERVER_KEY in its profile .env; "
+                        "the default profile key is never borrowed."
+                    ),
+                    "api_key_present": False,
+                }
+                continue
             report = _api_probe(api_client, profile)
-            report["api_key_present"] = key_present
+            report["api_key_present"] = True
             profile_reports[profile] = report
     else:
         for profile in requested:
