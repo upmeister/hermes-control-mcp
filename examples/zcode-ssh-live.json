@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "hermes": {
+      "type": "stdio",
+      "command": "ssh",
+      "args": [
+        "-T",
+        "hermes-host",
+        "/home/user/.local/bin/hermes-control-mcp",
+        "--gateway-owner-lease",
+        "/home/user/.hermes/runtime/owner_adapter/owner_adapter.json",
+        "--state-db",
+        "/home/user/.local/state/hermes-control-mcp/zcode-live.db",
+        "--log-level",
+        "WARNING"
+      ]
+    }
+  }
+}

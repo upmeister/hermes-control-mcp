@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from hermes_control_mcp.api import APIError
 from hermes_control_mcp.config import BridgeConfig
 from hermes_control_mcp.doctor import discover_named_profiles, format_doctor_report, run_doctor
 
@@ -29,6 +30,16 @@ class FakeAPIClient:
         target = profile or "default"
         self.calls.append(("models", target))
         return {"data": [{"id": f"model-{target}"}]}
+
+
+class FailingTransportAPIClient(FakeAPIClient):
+    def health(self, *, profile: str | None = None):
+        raise APIError(
+            0,
+            "transport_unknown",
+            "Hermes API transport outcome is unknown; retry explicitly with the same request ID",
+            retryable=True,
+        )
 
 
 class FakeLiveClient:
@@ -118,7 +129,7 @@ class DoctorTests(unittest.TestCase):
 
         self.assertFalse(report["ok"])
         self.assertEqual(report["status"], "not_ready")
-        self.assertEqual(report["core"]["error_code"], "doctor_check_failed")
+        self.assertEqual(report["core"]["error_code"], "api_key_missing")
         self.assertIn("Missing API key", report["core"]["error"])
 
     def test_configured_live_probe_can_be_required(self):
@@ -185,6 +196,28 @@ class DoctorTests(unittest.TestCase):
             )
             self.assertEqual(sorted(report["profiles"]), ["coder", "research-1"])
             self.assertTrue(report["ok"])
+
+    def test_human_report_includes_effective_config_and_actionable_transport_hint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = BridgeConfig(
+                api_url="http://127.0.0.1:8642",
+                api_key="default-test-key",
+                state_db=Path(tmp) / "state.db",
+                profiles_root=Path(tmp) / "profiles",
+                request_timeout=1,
+            )
+            report = run_doctor(
+                config,
+                api_client_factory=FailingTransportAPIClient,
+            )
+            rendered = format_doctor_report(report)
+
+        self.assertFalse(report["ok"])
+        self.assertIn("http://127.0.0.1:8642", rendered)
+        self.assertIn("API key ............ PRESENT (explicit configuration)", rendered)
+        self.assertIn("curl http://127.0.0.1:8642/health", rendered)
+        self.assertIn("127.0.0.1 refers to the machine running hermes-control-mcp", rendered)
+        self.assertNotIn("default-test-key", rendered)
 
     def test_human_report_never_prints_api_key_values(self):
         with tempfile.TemporaryDirectory() as tmp:

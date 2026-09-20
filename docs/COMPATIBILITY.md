@@ -159,6 +159,23 @@ SQLite serializes individual writes, but the bridge has higher-level
 check-then-admit semantics that are not advertised as multi-process safe in this
 release.
 
+## Platform support
+
+Current release CI runs on Linux.
+
+| Platform | Durable HTTP tier | Owner-lease live tier |
+|---|---|---|
+| Linux | Tested/supported | Experimental; requires compatible owner seam |
+| macOS | No deliberate durable-tier Linux dependency, but not CI-verified | Not supported by current owner attach |
+| Windows | No deliberate durable-tier Linux dependency, but not CI-verified | Not supported by current owner attach |
+
+The current owner-lease implementation is concretely Linux-specific: it fences
+PID reuse through `/proc/<pid>/stat` and validates a same-UID Unix-domain
+socket and private lease. Durable API routing does not use those mechanisms.
+
+See [Getting started and connection topologies](GETTING-STARTED.md) for the
+same-host, remote API, and SSH deployment shapes.
+
 ## Python and packaging
 
 Supported Python versions for the public beta:

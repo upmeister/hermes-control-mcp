@@ -4,6 +4,22 @@ All notable public changes to Hermes MCP Control Plane are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- User-first onboarding documentation for same-host, remote API, and SSH
+  topologies, with an explicit MCP-client configuration matrix for ZCode,
+  Claude Code, Cursor, Codex, and VS Code.
+- Actionable `doctor` diagnostics showing effective non-secret configuration,
+  failure detail, and next-step hints without exposing credential values.
+
+### Changed
+
+- The same-host deployment is now documented as the primary zero-friction
+  path; remote multi-profile guidance prefers keeping the bridge beside Hermes
+  instead of mirroring profile secret files onto another machine.
+- Documentation no longer describes one `mcpServers` JSON shape as generic
+  across all MCP hosts.
+
 ## [0.2.0b2] - 2026-09-20
 
 Compatibility/install patch.
