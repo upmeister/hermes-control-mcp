@@ -342,4 +342,4 @@ Read [AGENTS.md](AGENTS.md) before changing behavior. It defines the current sco
 
 MIT License. See [LICENSE](LICENSE).
 
-Stage 2.2C prepares the repository for a public beta but does not itself publish to PyPI. The final distribution/repository/CLI slug is intentionally confirmed immediately before the release rename/publication step.
+Stage 2.2C prepares the repository for a public beta but does not itself publish to PyPI. The confirmed public distribution/repository/CLI slug is `hermes-control-mcp`; the GitHub repository will be renamed after this release-hardening PR merges.
