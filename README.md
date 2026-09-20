@@ -78,7 +78,12 @@ Choose your topology first:
 | Another VM/host | `--api-url` + bridge-side key/env file; Hermes must be reachable over LAN/VPN/tunnel | not through the owner lease |
 | Launched on Hermes host through SSH | remote MCP client uses SSH; bridge still uses local Hermes config/secrets | recommended remote shape for experimental live attach |
 
-For the default same-host case:
+### Same-host happy path
+
+If the MCP client and Hermes run on the **same machine under the same user**,
+this is the intended zero-friction path: after Hermes API Server is enabled,
+you normally need **no** `--api-url`, `--env-file`, or `--profiles-root`
+arguments. The bridge uses Hermes' local defaults and secret files.
 
 ~~~bash
 hermes config set API_SERVER_ENABLED true
@@ -107,26 +112,17 @@ troubleshooting, read the **[Getting started and connection topologies](docs/GET
 
 ### MCP host configuration
 
-The smallest configuration below is valid only when the bridge runs in an
-environment where its defaults are correct (normally the same host/user as
-Hermes):
+MCP client configuration is **not standardized by the MCP protocol**. The
+familiar `{"mcpServers": {...}}` shape is common across several hosts and is
+accepted by ZCode's compatibility/full-config surfaces, but it is not universal:
+Codex uses TOML and VS Code uses a top-level `servers` object.
 
-~~~json
-{
-  "mcpServers": {
-    "hermes": {
-      "command": "hermes-control-mcp"
-    }
-  }
-}
-~~~
+See the **[MCP client configuration matrix](docs/MCP-CLIENTS.md)** for exact
+same-host and SSH examples for ZCode, Claude Code, Cursor, Codex, and VS Code.
 
-MCP client syntax varies. Some hosts require `"type": "stdio"`; that field is
-client configuration, not a bridge option.
+Existing ZCode examples:
 
-Examples:
-
-- [generic local stdio](examples/mcp-stdio.json)
+- [local/common `mcpServers` stdio shape](examples/mcp-stdio.json)
 - [ZCode → remote Hermes API](examples/zcode-remote-api.json)
 - [ZCode → SSH-launched bridge on Hermes host](examples/zcode-ssh.json)
 - [ZCode → SSH + experimental live owner attach](examples/zcode-ssh-live.json)
@@ -223,6 +219,7 @@ CI tests Python 3.11, 3.12, 3.13, and 3.14. It also builds wheel + sdist and per
 ## Documentation
 
 - [Getting started and connection topologies](docs/GETTING-STARTED.md)
+- [MCP client configuration matrix](docs/MCP-CLIENTS.md)
 - [Compatibility and support tiers](docs/COMPATIBILITY.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Hermes upstream research](docs/UPSTREAM-HERMES.md)
