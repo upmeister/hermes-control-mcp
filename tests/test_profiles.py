@@ -15,14 +15,14 @@ import unittest
 from pathlib import Path
 from urllib.parse import urlparse
 
-from hermes_zcode_bridge.api import APIResponse, HermesAPIClient
-from hermes_zcode_bridge.config import BridgeConfig
-from hermes_zcode_bridge.live_client import LiveGatewayClient
-from hermes_zcode_bridge.live_service import LiveService
-from hermes_zcode_bridge.mcp_server import _TOOL_DESCRIPTIONS
-from hermes_zcode_bridge.profiles import canonical_profile, named_profile_api_key
-from hermes_zcode_bridge.registry import StateRegistry
-from hermes_zcode_bridge.service import BridgeService, _fingerprint
+from hermes_control_mcp.api import APIResponse, HermesAPIClient
+from hermes_control_mcp.config import BridgeConfig
+from hermes_control_mcp.live_client import LiveGatewayClient
+from hermes_control_mcp.live_service import LiveService
+from hermes_control_mcp.mcp_server import _TOOL_DESCRIPTIONS
+from hermes_control_mcp.profiles import canonical_profile, named_profile_api_key
+from hermes_control_mcp.registry import StateRegistry
+from hermes_control_mcp.service import BridgeService, _fingerprint
 
 from test_contract import FakeTransport, response
 from test_live import FakeGateway

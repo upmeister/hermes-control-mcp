@@ -1,0 +1,1 @@
+"""Hermes MCP Control Plane package."""\n\n__version__ = "0.2.0b1"\n

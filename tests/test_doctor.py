@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from hermes_zcode_bridge.config import BridgeConfig
-from hermes_zcode_bridge.doctor import discover_named_profiles, format_doctor_report, run_doctor
+from hermes_control_mcp.config import BridgeConfig
+from hermes_control_mcp.doctor import discover_named_profiles, format_doctor_report, run_doctor
 
 
 class FakeAPIClient:

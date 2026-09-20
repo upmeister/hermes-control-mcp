@@ -1,4 +1,4 @@
-# hermes-zcode-bridge — project contract
+# hermes-control-mcp — project contract
 
 ## Purpose and boundaries
 
@@ -227,7 +227,7 @@ Run at minimum:
 ./scripts/test.sh
 python3 -m unittest discover -s tests -v
 python3 -m compileall -q src
-python3 -m py_compile src/hermes_zcode_bridge/*.py
+python3 -m py_compile src/hermes_control_mcp/*.py
 git diff --check
 ~~~
 

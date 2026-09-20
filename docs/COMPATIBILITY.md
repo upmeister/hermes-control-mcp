@@ -20,13 +20,13 @@ The live tier is optional unless a user explicitly requires it.
 Use:
 
 ~~~bash
-hermes-zcode-bridge doctor
+hermes-control-mcp doctor
 ~~~
 
 to check the durable core and treat live as optional, or:
 
 ~~~bash
-hermes-zcode-bridge doctor --require-live
+hermes-control-mcp doctor --require-live
 ~~~
 
 to make unavailable live attach a hard failure.
@@ -70,13 +70,13 @@ The bridge never borrows the default API key for a named profile.
 Probe explicit profiles:
 
 ~~~bash
-hermes-zcode-bridge doctor --profile coder --profile research
+hermes-control-mcp doctor --profile coder --profile research
 ~~~
 
 or discover syntactically valid named profile directories:
 
 ~~~bash
-hermes-zcode-bridge doctor --all-profiles
+hermes-control-mcp doctor --all-profiles
 ~~~
 
 Doctor only performs non-consuming readiness requests. It does not submit an

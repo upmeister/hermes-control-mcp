@@ -16,13 +16,13 @@ Publish the existing project as a normal Python package with a console entry
 point:
 
 ~~~text
-hermes-zcode-bridge
+hermes-control-mcp
 ~~~
 
 and ideally support an isolated runner workflow such as:
 
 ~~~text
-uvx hermes-zcode-bridge ...
+uvx hermes-control-mcp ...
 ~~~
 
 after release packaging is verified.

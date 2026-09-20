@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "hermes": {
+      "command": "hermes-control-mcp",
+      "args": [
+        "--state-db",
+        "~/.local/state/hermes-control-mcp/bridge.db"
+      ]
+    }
+  }
+}

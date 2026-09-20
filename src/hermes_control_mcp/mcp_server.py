@@ -100,7 +100,7 @@ def create_server(service: BridgeService):
     if MCPServer is None:
         raise RuntimeError("MCP server requires the 'mcp' package")
     server = MCPServer(
-        "hermes-zcode-bridge",
+        "hermes-control-mcp",
         instructions=(
             "Thin Hermes Agent durable-runs and live-TUI bridge. Use exact lane/session/run/request identities. "
             "Profile routing: an omitted profile first infers an exact locally known request/session or a lane's "

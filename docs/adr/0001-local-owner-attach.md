@@ -1,7 +1,7 @@
 # ADR-0001: Private owner adapter for Stage 2 live attach
 
 - **Status:** Accepted for Stage 2 merge. The adapter remains opt-in/default-disabled in code; later production enablement/deployment is an operational choice, not part of this ADR's original merge gate.
-- **Scope:** `hermes-zcode-bridge` Stage 2 live attach.
+- **Scope:** `hermes-control-mcp` Stage 2 live attach.
 - **Decision:** Use an opt-in, process-bound Unix-domain-socket owner adapter in the same Hermes web server/event loop. The bridge consumes its private lease and never reuses Dashboard `/api/ws` authentication.
 
 ## Context

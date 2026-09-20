@@ -23,7 +23,7 @@ from .registry import StateRegistry
 from .service import BridgeService
 
 
-logger = logging.getLogger("hermes_zcode_bridge")
+logger = logging.getLogger("hermes_control_mcp")
 
 
 def build_parser() -> argparse.ArgumentParser:

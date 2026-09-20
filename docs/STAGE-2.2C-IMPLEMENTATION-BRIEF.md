@@ -41,8 +41,15 @@ MIT.
 
 Product display name: **Hermes MCP Control Plane**.
 
-Final distribution/repository/CLI slug remains a maintainer decision during this
-stage. Do not publish under an unconfirmed name.
+Confirmed public distribution/repository/primary CLI slug:
+`hermes-control-mcp`.
+
+Python import package:
+`hermes_control_mcp`.
+
+The historical `hermes-zcode-bridge` console script may remain as a temporary
+compatibility alias for existing private deployments during the beta rename,
+but it is not the public brand.
 
 ## Required work
 
@@ -112,7 +119,7 @@ Document one-process-per-state-db as the public-beta ownership contract.
 - supported Python classifiers;
 - project URLs;
 - client-neutral description/keywords;
-- final distribution/CLI naming after maintainer confirmation.
+- confirmed `hermes-control-mcp` distribution/CLI/repository naming.
 
 ### C5 — compatibility docs
 
@@ -159,7 +166,7 @@ Before merge:
 - doctor unit tests green;
 - no secret canaries in output;
 - docs contain no private deployment host/path;
-- exact package name and CLI confirmed;
+- package/CLI name is `hermes-control-mcp`;
 - MIT LICENSE present;
 - public README marks live as experimental/optional;
 - public README does not imply stock Hermes ships the owner adapter.

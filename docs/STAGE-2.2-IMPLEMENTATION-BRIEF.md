@@ -190,7 +190,7 @@ later API-cleanup PR; it is not required here.
 Expected:
 
 ~~~text
-src/hermes_zcode_bridge/live_service.py
+src/hermes_control_mcp/live_service.py
 tests/test_live.py
 README.md and/or CHANGELOG.md if behavior wording changes
 ~~~
@@ -206,7 +206,7 @@ Before requesting review:
 ./scripts/test.sh
 python3 -m unittest discover -s tests -v
 python3 -m compileall -q src
-python3 -m py_compile src/hermes_zcode_bridge/*.py
+python3 -m py_compile src/hermes_control_mcp/*.py
 git diff --check
 ~~~
 

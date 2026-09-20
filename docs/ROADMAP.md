@@ -1,6 +1,6 @@
 # Roadmap
 
-This document is the implementation-facing roadmap for hermes-zcode-bridge.
+This document is the implementation-facing roadmap for hermes-control-mcp.
 
 The project is intentionally split into small reviewable stages. A roadmap item
 is not permission to pull adjacent items into the same PR.

@@ -4,7 +4,7 @@ Research date: **2026-09-20**.
 Fresh current-main SHA checked for the Stage 2.2B handoff:
 `8a92051f20e6b371c4ff1a46a5bcec7138cc4e8c`.
 
-This document records facts relevant to hermes-zcode-bridge. It deliberately
+This document records facts relevant to hermes-control-mcp. It deliberately
 separates stable release behavior, current-main observations and open proposals.
 
 Upstream changes quickly; re-verify before implementing against an internal

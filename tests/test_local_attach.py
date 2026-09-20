@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from hermes_zcode_bridge.local_attach import OwnerAttachError, load_owner_attach_target, process_start_marker
+from hermes_control_mcp.local_attach import OwnerAttachError, load_owner_attach_target, process_start_marker
 
 
 class LocalAttachTests(unittest.TestCase):

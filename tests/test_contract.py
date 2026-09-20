@@ -8,10 +8,10 @@ import unittest
 from pathlib import Path
 from urllib.parse import urlparse
 
-from hermes_zcode_bridge.api import APIError, APIResponse, HermesAPIClient
-from hermes_zcode_bridge.config import BridgeConfig, ConfigError
-from hermes_zcode_bridge.registry import REGISTRY_SCHEMA_VERSION, RegistryError, StateRegistry
-from hermes_zcode_bridge.service import BridgeService
+from hermes_control_mcp.api import APIError, APIResponse, HermesAPIClient
+from hermes_control_mcp.config import BridgeConfig, ConfigError
+from hermes_control_mcp.registry import REGISTRY_SCHEMA_VERSION, RegistryError, StateRegistry
+from hermes_control_mcp.service import BridgeService
 
 
 class FakeTransport:
@@ -370,7 +370,7 @@ class ConfigContractTests(unittest.TestCase):
 
 class MCPContractTests(unittest.TestCase):
     def test_mcp_surface_is_allowlisted(self):
-        from hermes_zcode_bridge.mcp_server import create_server
+        from hermes_control_mcp.mcp_server import create_server
 
         with tempfile.TemporaryDirectory() as tmp:
             config = BridgeConfig(api_url="http://bridge.test", api_key="x", state_db=Path(tmp) / "state.db")
@@ -397,7 +397,7 @@ class MCPContractTests(unittest.TestCase):
         self.assertNotIn("cli_exec", names)
 
     def test_live_session_id_descriptions_separate_stored_and_runtime_namespaces(self):
-        from hermes_zcode_bridge.mcp_server import create_server
+        from hermes_control_mcp.mcp_server import create_server
 
         with tempfile.TemporaryDirectory() as tmp:
             config = BridgeConfig(api_url="http://bridge.test", api_key="x", state_db=Path(tmp) / "state.db")

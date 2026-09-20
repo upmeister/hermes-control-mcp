@@ -3,7 +3,7 @@ requires = ["setuptools>=68,<81"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "hermes-zcode-bridge"
+name = "hermes-control-mcp"
 version = "0.2.0b1"
 description = "MCP control plane for Hermes Agent durable runs and optional shared live sessions"
 readme = "README.md"
@@ -28,12 +28,13 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/upmeister/hermes-zcode-bridge"
-Issues = "https://github.com/upmeister/hermes-zcode-bridge/issues"
-Documentation = "https://github.com/upmeister/hermes-zcode-bridge#readme"
+Repository = "https://github.com/upmeister/hermes-control-mcp"
+Issues = "https://github.com/upmeister/hermes-control-mcp/issues"
+Documentation = "https://github.com/upmeister/hermes-control-mcp#readme"
 
 [project.scripts]
-hermes-zcode-bridge = "hermes_zcode_bridge.server:main"
+hermes-control-mcp = "hermes_control_mcp.server:main"
+hermes-zcode-bridge = "hermes_control_mcp.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

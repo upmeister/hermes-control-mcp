@@ -111,7 +111,7 @@ class HermesAPIClient:
         headers = {
             "Authorization": f"Bearer {key}",
             "Accept": "application/json",
-            "User-Agent": "hermes-zcode-bridge/0.1",
+            "User-Agent": "hermes-control-mcp/0.1",
         }
         if extra:
             headers.update(extra)

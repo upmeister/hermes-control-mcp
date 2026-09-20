@@ -22,7 +22,7 @@ MCP client
    |
    | stdio (locally or over SSH)
    v
-hermes-zcode-bridge
+hermes-control-mcp
    |
    +-- durable plane --> Hermes API Server --> /v1/runs, history, status, control
    |
@@ -168,37 +168,39 @@ See [Compatibility and support tiers](docs/COMPATIBILITY.md).
 Python 3.11–3.13 are supported by the public-beta CI matrix.
 
 ~~~bash
-git clone https://github.com/upmeister/hermes-zcode-bridge.git
-cd hermes-zcode-bridge
+git clone https://github.com/upmeister/hermes-control-mcp.git
+cd hermes-control-mcp
 
 python -m venv .venv
 . .venv/bin/activate
 pip install -e .
 ~~~
 
-The current transitional console entrypoint is:
+The public package and primary CLI are:
 
 ~~~bash
-hermes-zcode-bridge --help
+hermes-control-mcp --help
 ~~~
 
-The public package/CLI slug will be renamed before publication; the product name is **Hermes MCP Control Plane**.
+The Python import package is `hermes_control_mcp`. Existing private deployments
+may temporarily keep the legacy `hermes-zcode-bridge` console alias during the
+beta rename, but new configuration should use `hermes-control-mcp`.
 
 ### Readiness doctor
 
 Run non-consuming readiness checks before wiring the bridge into an MCP host:
 
 ~~~bash
-hermes-zcode-bridge doctor
-hermes-zcode-bridge doctor --profile coder
-hermes-zcode-bridge doctor --all-profiles
-hermes-zcode-bridge doctor --json
+hermes-control-mcp doctor
+hermes-control-mcp doctor --profile coder
+hermes-control-mcp doctor --all-profiles
+hermes-control-mcp doctor --json
 ~~~
 
 The default gate checks the durable core and requested named profiles while treating live attach as optional. To require the shared live tier:
 
 ~~~bash
-hermes-zcode-bridge doctor --require-live
+hermes-control-mcp doctor --require-live
 ~~~
 
 Doctor never submits an LLM run/prompt or mutates Hermes configuration.
@@ -213,9 +215,9 @@ A typical stdio MCP client launches the bridge as a long-lived process. If Herme
       "args": [
         "-T",
         "hermes-host",
-        "/path/to/hermes-zcode-bridge/.venv/bin/hermes-zcode-bridge",
+        "/path/to/hermes-control-mcp/.venv/bin/hermes-control-mcp",
         "--state-db",
-        "~/.local/state/hermes-zcode-bridge/bridge.db"
+        "~/.local/state/hermes-control-mcp/bridge.db"
       ]
     }
   }
@@ -227,7 +229,7 @@ Secrets should stay on the Hermes host. Do not place API keys, Dashboard credent
 Live owner attach additionally requires a compatible owner-adapter lease:
 
 ~~~bash
-hermes-zcode-bridge \
+hermes-control-mcp \
   --gateway-owner-lease "$HERMES_HOME/runtime/owner_adapter/owner_adapter.json"
 ~~~
 
@@ -239,7 +241,7 @@ This live path is optional/experimental for the public beta. Stock Hermes v0.21.
 ./scripts/test.sh
 python3 -m unittest discover -s tests -v
 python3 -m compileall -q src
-python3 -m py_compile src/hermes_zcode_bridge/*.py
+python3 -m py_compile src/hermes_control_mcp/*.py
 ~~~
 
 The project uses deterministic fake transports for most protocol tests plus real WebSocket/UDS smoke coverage where transport behavior matters.

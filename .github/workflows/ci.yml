@@ -39,7 +39,7 @@ jobs:
       - name: Compile checks
         run: |
           python -m compileall -q src
-          python -m py_compile src/hermes_zcode_bridge/*.py
+          python -m py_compile src/hermes_control_mcp/*.py
 
       - name: Diff check
         run: git diff --check
@@ -66,12 +66,12 @@ jobs:
 
       - name: Install wheel in a fresh venv
         run: |
-          python -m venv /tmp/hermes-bridge-smoke
-          /tmp/hermes-bridge-smoke/bin/python -m pip install --upgrade pip
-          /tmp/hermes-bridge-smoke/bin/python -m pip install dist/*.whl
-          /tmp/hermes-bridge-smoke/bin/hermes-zcode-bridge --help
+          python -m venv /tmp/hermes-control-mcp-smoke
+          /tmp/hermes-control-mcp-smoke/bin/python -m pip install --upgrade pip
+          /tmp/hermes-control-mcp-smoke/bin/python -m pip install dist/*.whl
+          /tmp/hermes-control-mcp-smoke/bin/hermes-control-mcp --help
 
       - name: Installed MCP stdio smoke
         run: |
           python scripts/installed_smoke.py \
-            --entrypoint /tmp/hermes-bridge-smoke/bin/hermes-zcode-bridge
+            --entrypoint /tmp/hermes-control-mcp-smoke/bin/hermes-control-mcp
