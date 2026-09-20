@@ -38,6 +38,9 @@ upstream/API research.
 - Stage 2.2C: complete — public-beta packaging, doctor, schema v1, CI and
   compatibility/release documentation.
 - Current release line: **0.2.x public beta**.
+- UX1 queued: non-mutating client-config onboarding for same-host and SSH stdio
+  deployments; implementation contract lives in
+  `docs/UX1-IMPLEMENTATION-BRIEF.md`.
 
 New work should start from one explicit problem/contract rather than reopening
 historical Stage 2 milestones. HTTP MCP, interactive approvals, native transport
@@ -179,12 +182,14 @@ Use [ROADMAP.md](docs/ROADMAP.md) for current priorities.
 
 High-level boundaries:
 
-1. research Agent Sessions API parity before migrating durable Runs behavior;
-2. prefer a supported Hermes native/session-authority seam over growing the
+1. complete UX1 as a small non-mutating onboarding layer without changing the
+   bridge trust model;
+2. research Agent Sessions API parity before migrating durable Runs behavior;
+3. prefer a supported Hermes native/session-authority seam over growing the
    private owner adapter;
-3. treat interactive server requests as a separate security design;
-4. treat Streamable HTTP MCP as a new remote trust boundary;
-5. keep broad A2A/peer orchestration out of scope without a concrete use case.
+4. treat interactive server requests as a separate security design;
+5. treat Streamable HTTP MCP as a new remote trust boundary;
+6. keep broad A2A/peer orchestration out of scope without a concrete use case.
 
 ## Upstream-awareness rules
 
