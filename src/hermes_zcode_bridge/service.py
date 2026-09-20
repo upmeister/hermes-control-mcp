@@ -7,6 +7,7 @@ import uuid
 from typing import Any
 
 from .api import APIError, HermesAPIClient
+from .profiles import DEFAULT_PROFILE, canonical_profile
 from .registry import StateRegistry
 
 
@@ -15,6 +16,10 @@ TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "interrupted"
 
 class InputError(ValueError):
     """Caller input is unsafe or incomplete."""
+
+    def __init__(self, message: str, *, code: str = "invalid_input"):
+        super().__init__(message)
+        self.code = code
 
 
 def _validate_text(
@@ -48,10 +53,42 @@ def _safe_refs(value: Any) -> list[str]:
     return [str(item)[:500] for item in value if isinstance(item, str) and item][:50]
 
 
-def _fingerprint(lane: str, body: dict[str, Any]) -> str:
-    # The prompt is hashed, never persisted in the bridge registry.
-    encoded = json.dumps({"lane": lane, "body": body}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+def _fingerprint(lane: str, body: dict[str, Any], profile: str | None = None) -> str:
+    # The prompt is hashed, never persisted in the bridge registry. Named
+    # profiles join the fingerprint so a replay can never cross profile
+    # boundaries; default-profile fingerprints stay byte-compatible with
+    # pre-2.2B rows so existing replays keep matching after upgrade.
+    payload: dict[str, Any] = {"lane": lane, "body": body}
+    if profile and profile != DEFAULT_PROFILE:
+        payload["profile"] = profile
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _profile_input(value: Any) -> str:
+    """Canonicalize a caller-supplied profile; None means the default profile.
+
+    Raises InputError(code='invalid_profile') before any filesystem or network
+    use so profile strings can never become path or URL input.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return DEFAULT_PROFILE
+    try:
+        return canonical_profile(value)
+    except ValueError as exc:
+        raise InputError(str(exc), code="invalid_profile") from exc
+
+
+def _optional_profile(value: Any) -> str | None:
+    """Canonicalize a profile that may be genuinely omitted (None).
+
+    The None-vs-default distinction is load-bearing for exact run/session
+    resolution: an omitted profile may infer a stored record's profile, while
+    an explicitly supplied profile that differs is a conflict, not a reroute.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    return _profile_input(value)
 
 
 def _record_error(exc: APIError) -> tuple[str, str | None]:
@@ -100,7 +137,8 @@ class BridgeService:
     @staticmethod
     def _input_error(exc: Exception, *, request_id: str | None = None) -> dict[str, Any]:
         return BridgeService._result(
-            status="failed", request_id=request_id, error_code="invalid_input", error=str(exc)
+            status="failed", request_id=request_id, error_code=getattr(exc, "code", "invalid_input"),
+            error=str(exc)
         )
 
     @staticmethod
@@ -111,16 +149,26 @@ class BridgeService:
             error_code=code, error=str(exc)
         )
 
-    def _lane_session(self, lane: str, supplied: str | None) -> tuple[str | None, dict[str, Any] | None]:
-        selected = supplied if supplied else self.registry.session_for_lane(lane)
+    def _lane_session(
+        self, profile: str, lane: str, supplied: str | None
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        selected = supplied if supplied else self.registry.session_for_profile_lane(profile, lane)
         if selected is not None:
             selected = _validate_text(selected, "session_id")
-        current = self.registry.session_for_lane(lane)
+        current = self.registry.session_for_profile_lane(profile, lane)
         if supplied and current and supplied != current:
             return None, self._result(
                 status="failed", error_code="lane_session_conflict",
                 error="The lane is already bound to a different session_id"
             )
+        if supplied:
+            bound_profiles = self.registry.profiles_for_session(supplied)
+            if bound_profiles and profile not in bound_profiles:
+                return None, self._result(
+                    status="failed", error_code="lane_profile_conflict",
+                    error=(f"The supplied session belongs to profile lane(s) {bound_profiles}; "
+                           f"refusing to bind it under profile {profile!r}"),
+                )
         return selected, None
 
     def _existing_result(self, record: dict[str, Any], *, replayed: bool = True) -> dict[str, Any]:
@@ -130,6 +178,7 @@ class BridgeService:
             run_id=record.get("run_id"),
             session_id=record.get("session_id"),
             error_code=record.get("error_code"),
+            profile=str(record.get("profile") or DEFAULT_PROFILE),
             replayed=replayed,
         )
 
@@ -144,6 +193,7 @@ class BridgeService:
         instructions: str | None = None,
         request_id: str | None = None,
         idempotency_key: str | None = None,
+        profile: str | None = None,
     ) -> dict[str, Any]:
         try:
             lane = _validate_text(lane, "lane", max_length=200)
@@ -160,8 +210,9 @@ class BridgeService:
                 instructions = _validate_text(
                     instructions, "instructions", max_length=100_000, allow_common_whitespace=True
                 )
+            profile = _profile_input(profile)
             request_id = _visible_id(request_id, "request_id", max_length=128) if request_id else f"req_{uuid.uuid4().hex}"
-            selected_session, lane_error = self._lane_session(lane, session_id)
+            selected_session, lane_error = self._lane_session(profile, lane, session_id)
             if lane_error is not None:
                 lane_error["request_id"] = request_id
                 return lane_error
@@ -176,12 +227,19 @@ class BridgeService:
             ):
                 if value:
                     body_for_fingerprint[key] = value
-            fingerprint = _fingerprint(lane, body_for_fingerprint)
+            fingerprint = _fingerprint(lane, body_for_fingerprint, profile)
         except InputError as exc:
             return self._input_error(exc, request_id=request_id)
 
         existing = self.registry.request_by_id(request_id)
         if existing is not None:
+            if str(existing.get("profile") or DEFAULT_PROFILE) != profile:
+                return self._result(
+                    status="failed", request_id=request_id, run_id=existing.get("run_id"),
+                    session_id=existing.get("session_id"), error_code="request_profile_conflict",
+                    error=(f"request_id was already used under profile "
+                           f"{str(existing.get('profile') or DEFAULT_PROFILE)!r}; profile boundaries are never rerouted"),
+                )
             if existing.get("fingerprint") != fingerprint:
                 return self._result(
                     status="failed", request_id=request_id, run_id=existing.get("run_id"),
@@ -211,13 +269,14 @@ class BridgeService:
                 )
             self.registry.save_request(
                 request_id=request_id, lane=lane, session_id=selected_session, run_id=None,
-                idempotency_key=idempotency_key, fingerprint=fingerprint, status="pending"
+                idempotency_key=idempotency_key, fingerprint=fingerprint, status="pending",
+                profile=profile,
             )
 
         try:
             payload = self.client.submit_run(
                 prompt=prompt, idempotency_key=idempotency_key, session_id=selected_session,
-                model=model, provider=provider, instructions=instructions,
+                model=model, provider=provider, instructions=instructions, profile=profile,
             )
         except APIError as exc:
             status, code = _record_error(exc)
@@ -244,24 +303,56 @@ class BridgeService:
             request_id, status=status, run_id=run_id, session_id=effective_session,
             error_code=None
         )
-        self.registry.bind_lane(lane, effective_session)
+        self.registry.bind_profile_lane(profile, lane, effective_session)
         return self._result(
             status=status, request_id=request_id, run_id=run_id, session_id=effective_session,
             answer=payload.get("output") if isinstance(payload.get("output"), str) else None,
-            replayed=replayed,
+            replayed=replayed, profile=profile,
             artifact_refs=payload.get("artifact_refs"), commit_refs=payload.get("commit_refs")
         )
 
-    def _resolve_run(self, *, lane: str | None = None, run_id: str | None = None) -> tuple[str | None, dict[str, Any] | None, dict[str, Any] | None]:
+    def _resolve_run(
+        self, *, lane: str | None = None, run_id: str | None = None, profile: str | None = None,
+    ) -> tuple[str | None, dict[str, Any] | None, str, dict[str, Any] | None]:
+        """Resolve the exact run and its governing profile.
+
+        A local record owns the profile: an omitted profile infers it, and a
+        supplied different profile is a conflict, never a reroute. An external
+        run id unknown locally routes through the supplied profile or the
+        default profile for backward compatibility.
+        """
         if run_id:
             run_id = _validate_text(run_id, "run_id")
-            return run_id, self.registry.request_by_run(run_id), None
+            record = self.registry.request_by_run(run_id)
+            if record is not None:
+                record_profile = str(record.get("profile") or DEFAULT_PROFILE)
+                if profile is not None and profile != record_profile:
+                    return None, None, profile, self._result(
+                        status="failed", error_code="request_profile_conflict",
+                        error=(f"Run {run_id} belongs to profile {record_profile!r}; "
+                               f"refusing to route it through profile {profile!r}"),
+                    )
+                return run_id, record, record_profile, None
+            return run_id, None, profile or DEFAULT_PROFILE, None
         if lane:
             lane = _validate_text(lane, "lane", max_length=200)
-            record = self.registry.latest_request_for_lane(lane)
+            if profile is not None:
+                record = self.registry.latest_request_for_profile_lane(profile, lane)
+            else:
+                lane_profiles = self.registry.request_profiles_for_lane(lane)
+                if len(lane_profiles) > 1:
+                    return None, None, profile or DEFAULT_PROFILE, self._result(
+                        status="failed", error_code="lane_profile_ambiguous",
+                        error=(f"Lane {lane!r} exists under multiple profiles {lane_profiles}; "
+                               "supply an explicit profile"),
+                    )
+                effective = lane_profiles[0] if lane_profiles else DEFAULT_PROFILE
+                record = self.registry.latest_request_for_profile_lane(effective, lane)
             if record and record.get("run_id"):
-                return str(record["run_id"]), record, None
-        return None, None, self._result(status="failed", error_code="run_not_found_local", error="No local run matches the supplied lane/run_id")
+                return str(record["run_id"]), record, str(record.get("profile") or DEFAULT_PROFILE), None
+        return None, None, profile or DEFAULT_PROFILE, self._result(
+            status="failed", error_code="run_not_found_local", error="No local run matches the supplied lane/run_id"
+        )
 
     @staticmethod
     def _server_result(payload: dict[str, Any], *, request_id: str | None, known_run_id: str | None, known_session_id: str | None, replayed: bool = False) -> dict[str, Any]:
@@ -282,9 +373,10 @@ class BridgeService:
             artifact_refs=payload.get("artifact_refs"), commit_refs=payload.get("commit_refs")
         )
 
-    def status(self, *, lane: str | None = None, run_id: str | None = None) -> dict[str, Any]:
+    def status(self, *, lane: str | None = None, run_id: str | None = None, profile: str | None = None) -> dict[str, Any]:
         try:
-            resolved_run, record, local_error = self._resolve_run(lane=lane, run_id=run_id)
+            profile = _optional_profile(profile)
+            resolved_run, record, resolved_profile, local_error = self._resolve_run(lane=lane, run_id=run_id, profile=profile)
         except InputError as exc:
             return self._input_error(exc)
         if local_error is not None:
@@ -292,13 +384,14 @@ class BridgeService:
         request_id = record.get("request_id") if record else None
         known_session = record.get("session_id") if record else None
         try:
-            payload = self.client.status(str(resolved_run))
+            payload = self.client.status(str(resolved_run), profile=resolved_profile)
         except APIError as exc:
             return self._api_error(exc, request_id=request_id, run_id=resolved_run, session_id=known_session)
         result = self._server_result(
             payload, request_id=str(request_id) if request_id else None,
             known_run_id=resolved_run, known_session_id=known_session
         )
+        result["profile"] = resolved_profile
         if record:
             fields: dict[str, Any] = {"status": result["status"]}
             if result.get("session_id"):
@@ -307,16 +400,18 @@ class BridgeService:
                 fields["error_code"] = result["error_code"]
             self.registry.update_request(str(request_id), **fields)
             if result.get("session_id"):
-                self.registry.bind_lane(str(record["lane"]), str(result["session_id"]))
+                self.registry.bind_profile_lane(resolved_profile, str(record["lane"]), str(result["session_id"]))
         return result
 
     def wait(
         self, *, lane: str | None = None, run_id: str | None = None,
-        timeout_seconds: float = 30.0, poll_interval_seconds: float | None = None
+        timeout_seconds: float = 30.0, poll_interval_seconds: float | None = None,
+        profile: str | None = None,
     ) -> dict[str, Any]:
         try:
             timeout = max(0.0, min(float(timeout_seconds), 3600.0))
             interval = max(0.05, min(float(poll_interval_seconds or self.client.config.poll_interval), 10.0))
+            profile = _optional_profile(profile)
         except (TypeError, ValueError) as exc:
             return self._input_error(InputError("timeout_seconds and poll_interval_seconds must be numbers"))
         deadline = time.monotonic() + timeout
@@ -324,7 +419,7 @@ class BridgeService:
         latest: dict[str, Any] | None = None
         while first or time.monotonic() <= deadline:
             first = False
-            latest = self.status(lane=lane, run_id=run_id)
+            latest = self.status(lane=lane, run_id=run_id, profile=profile)
             if latest.get("status") in TERMINAL_STATUSES or latest.get("error_code"):
                 return latest
             if time.monotonic() >= deadline:
@@ -336,15 +431,16 @@ class BridgeService:
         latest["error"] = "Run is still active; call run_wait again or run_status to reconcile"
         return latest
 
-    def events(self, *, lane: str | None = None, run_id: str | None = None) -> dict[str, Any]:
+    def events(self, *, lane: str | None = None, run_id: str | None = None, profile: str | None = None) -> dict[str, Any]:
         try:
-            resolved_run, record, local_error = self._resolve_run(lane=lane, run_id=run_id)
+            profile = _optional_profile(profile)
+            resolved_run, record, resolved_profile, local_error = self._resolve_run(lane=lane, run_id=run_id, profile=profile)
         except InputError as exc:
             return self._input_error(exc)
         if local_error is not None:
             return local_error
         try:
-            events = self.client.events(str(resolved_run))
+            events = self.client.events(str(resolved_run), profile=resolved_profile)
         except APIError as exc:
             return self._api_error(
                 exc, request_id=record.get("request_id") if record else None,
@@ -355,70 +451,109 @@ class BridgeService:
             terminal, request_id=record.get("request_id") if record else None,
             known_run_id=resolved_run, known_session_id=record.get("session_id") if record else None
         )
+        result["profile"] = resolved_profile
         result["events"] = events
         result["event_count"] = len(events)
         return result
 
-    def stop(self, *, lane: str | None = None, run_id: str | None = None) -> dict[str, Any]:
+    def stop(self, *, lane: str | None = None, run_id: str | None = None, profile: str | None = None) -> dict[str, Any]:
         try:
-            resolved_run, record, local_error = self._resolve_run(lane=lane, run_id=run_id)
+            profile = _optional_profile(profile)
+            resolved_run, record, resolved_profile, local_error = self._resolve_run(lane=lane, run_id=run_id, profile=profile)
         except InputError as exc:
             return self._input_error(exc)
         if local_error is not None:
             return local_error
         try:
-            payload = self.client.stop(str(resolved_run))
+            payload = self.client.stop(str(resolved_run), profile=resolved_profile)
         except APIError as exc:
             return self._api_error(exc, request_id=record.get("request_id") if record else None, run_id=resolved_run, session_id=record.get("session_id") if record else None)
         result = self._server_result(payload, request_id=record.get("request_id") if record else None, known_run_id=resolved_run, known_session_id=record.get("session_id") if record else None)
+        result["profile"] = resolved_profile
         if record:
             self.registry.update_request(str(record["request_id"]), status=result["status"])
         return result
 
-    def steer(self, *, text: str, lane: str | None = None, run_id: str | None = None) -> dict[str, Any]:
+    def steer(self, *, text: str, lane: str | None = None, run_id: str | None = None, profile: str | None = None) -> dict[str, Any]:
         try:
             text = _validate_text(text, "text", max_length=100_000, allow_common_whitespace=True)
             if not text.strip():
                 raise InputError("text must not be blank")
-            resolved_run, record, local_error = self._resolve_run(lane=lane, run_id=run_id)
+            profile = _optional_profile(profile)
+            resolved_run, record, resolved_profile, local_error = self._resolve_run(lane=lane, run_id=run_id, profile=profile)
         except InputError as exc:
             return self._input_error(exc)
         if local_error is not None:
             return local_error
         try:
-            payload = self.client.steer(str(resolved_run), text)
+            payload = self.client.steer(str(resolved_run), text, profile=resolved_profile)
         except APIError as exc:
             return self._api_error(exc, request_id=record.get("request_id") if record else None, run_id=resolved_run, session_id=record.get("session_id") if record else None)
         result = self._server_result(payload, request_id=record.get("request_id") if record else None, known_run_id=resolved_run, known_session_id=record.get("session_id") if record else None)
+        result["profile"] = resolved_profile
         if result["status"] == "unknown":
             result["status"] = "running"
         return result
 
-    def history(self, *, session_id: str, limit: int = 100) -> dict[str, Any]:
+    def history(self, *, session_id: str, limit: int = 100, profile: str | None = None) -> dict[str, Any]:
         try:
             session_id = _validate_text(session_id, "session_id")
             limit = max(1, min(int(limit), 500))
+            profile = _optional_profile(profile)
+            # A locally known session owns its profile: infer it when omitted
+            # and refuse a supplied different profile rather than rerouting.
+            session_profiles = sorted(
+                set(self.registry.profiles_for_request_session(session_id))
+                | set(self.registry.profiles_for_session(session_id))
+            )
+            if len(session_profiles) > 1:
+                if profile is None:
+                    return self._result(
+                        status="failed", error_code="lane_profile_ambiguous",
+                        error=(f"Session {session_id} appears under multiple profiles {session_profiles}; "
+                               "supply an explicit profile"),
+                    )
+                if profile not in session_profiles:
+                    # The exact ID/profile relationship is ambiguous locally;
+                    # an unrelated supplied profile must not create a reroute.
+                    return self._result(
+                        status="failed", error_code="request_profile_conflict",
+                        error=(f"Session {session_id} is locally bound under profiles {session_profiles}; "
+                               f"refusing to route it through unrelated profile {profile!r}"),
+                    )
+            if len(session_profiles) == 1 and profile is not None and profile != session_profiles[0]:
+                return self._result(
+                    status="failed", error_code="request_profile_conflict",
+                    error=(f"Session {session_id} belongs to profile {session_profiles[0]!r}; "
+                           f"refusing to route it through profile {profile!r}"),
+                )
+            if len(session_profiles) == 1 and profile is None:
+                profile = session_profiles[0]
+            profile = profile or DEFAULT_PROFILE
         except (InputError, TypeError, ValueError) as exc:
             return self._input_error(exc if isinstance(exc, Exception) else InputError(str(exc)))
         try:
-            payload = self.client.history(session_id, limit=limit)
+            payload = self.client.history(session_id, limit=limit, profile=profile)
         except APIError as exc:
             return self._api_error(exc, session_id=session_id)
         messages = payload.get("data", []) if isinstance(payload.get("data", []), list) else []
         return self._result(
             status="completed", session_id=str(payload.get("session_id") or session_id),
-            messages=messages, pagination=payload.get("pagination") or {}
+            messages=messages, pagination=payload.get("pagination") or {}, profile=profile,
         )
 
-    def health(self) -> dict[str, Any]:
+    def health(self, *, profile: str | None = None) -> dict[str, Any]:
         try:
-            health = self.client.health()
-            models = self.client.models()
-            capabilities = self.client.capabilities()
+            profile = _optional_profile(profile)
+            health = self.client.health(profile=profile)
+            models = self.client.models(profile=profile)
+            capabilities = self.client.capabilities(profile=profile)
         except APIError as exc:
             return self._api_error(exc)
+        except InputError as exc:
+            return self._input_error(exc)
         return self._result(
-            status="healthy", health=health, models=models, capabilities=capabilities
+            status="healthy", health=health, models=models, capabilities=capabilities, profile=profile
         )
 
     # The live surface is kept in live_service.py so the durable-runs facade

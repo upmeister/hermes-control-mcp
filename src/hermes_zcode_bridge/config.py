@@ -23,6 +23,11 @@ def hermes_home() -> Path:
     return Path(configured).expanduser() if configured else Path.home() / ".hermes"
 
 
+def default_profiles_root() -> Path:
+    """Named-profiles root, mirroring Hermes ``hermes_cli.profiles`` layout."""
+    return hermes_home() / "profiles"
+
+
 def default_state_db() -> Path:
     state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")).expanduser()
     return state_home / "hermes-zcode-bridge" / "bridge.db"
@@ -105,6 +110,9 @@ class BridgeConfig:
     api_url: str = DEFAULT_API_URL
     api_key: str | None = field(default=None, repr=False)
     state_db: Path = field(default_factory=default_state_db)
+    # Non-secret routing root for named-profile .env resolution; a named
+    # profile's own API_SERVER_KEY is read from <profiles_root>/<profile>/.env.
+    profiles_root: Path | None = None
     request_timeout: float = 120.0
     poll_interval: float = 0.5
     api_key_env: str = DEFAULT_API_KEY_ENV
@@ -138,6 +146,8 @@ class BridgeConfig:
         if not self.api_url:
             raise ConfigError("API URL must not be empty")
         self.state_db = Path(self.state_db).expanduser()
+        if self.profiles_root is not None:
+            self.profiles_root = Path(self.profiles_root).expanduser()
         if self.env_file is not None:
             self.env_file = Path(self.env_file).expanduser()
         if self.gateway_owner_lease_path is not None:
@@ -169,6 +179,9 @@ class BridgeConfig:
 
     def resolved_api_key(self) -> str:
         return resolve_api_key(api_key=self.api_key, api_key_env=self.api_key_env, env_file=self.env_file)
+
+    def resolved_profiles_root(self) -> Path:
+        return self.profiles_root if self.profiles_root is not None else default_profiles_root()
 
     def resolved_gateway_token(self) -> str | None:
         return _resolve_secret(self.gateway_token, self.gateway_token_env, self.env_file or (hermes_home() / ".env"))
