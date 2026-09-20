@@ -15,11 +15,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
-from hermes_zcode_bridge.config import BridgeConfig
-from hermes_zcode_bridge.live_client import LiveError, LiveGatewayClient, LiveTransportUnknown
-from hermes_zcode_bridge.local_attach import process_start_marker
-from hermes_zcode_bridge.live_service import LiveService
-from hermes_zcode_bridge.registry import StateRegistry
+from hermes_control_mcp.config import BridgeConfig
+from hermes_control_mcp.live_client import LiveError, LiveGatewayClient, LiveTransportUnknown
+from hermes_control_mcp.local_attach import process_start_marker
+from hermes_control_mcp.live_service import LiveService
+from hermes_control_mcp.registry import StateRegistry
 
 
 _CLOSE = object()

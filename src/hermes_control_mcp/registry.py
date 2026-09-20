@@ -11,6 +11,9 @@ class RegistryError(RuntimeError):
     """A safe bridge registry operation failed."""
 
 
+REGISTRY_SCHEMA_VERSION = 1
+
+
 class StateRegistry:
     """Small durable registry for lanes and redacted request state.
 
@@ -33,6 +36,13 @@ class StateRegistry:
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False, timeout=30)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
+        current_version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+        if current_version > REGISTRY_SCHEMA_VERSION:
+            self._conn.close()
+            raise RegistryError(
+                f"bridge registry schema {current_version} is newer than supported "
+                f"version {REGISTRY_SCHEMA_VERSION}; upgrade the bridge before opening this database"
+            )
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS lanes (
@@ -130,8 +140,14 @@ class StateRegistry:
                 """INSERT OR IGNORE INTO lane_bindings(profile, lane, session_id, updated_at)
                    SELECT 'default', lane, session_id, updated_at FROM lanes"""
             )
+            self._conn.execute(f"PRAGMA user_version={REGISTRY_SCHEMA_VERSION}")
             self._conn.commit()
         self._tighten_permissions()
+
+    @property
+    def schema_version(self) -> int:
+        with self._lock:
+            return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
 
     def _tighten_permissions(self) -> None:
         if self._db_path == ":memory:":

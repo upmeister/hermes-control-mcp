@@ -6,6 +6,18 @@ All notable user-facing changes to this local bridge are documented here.
 
 ### Added
 
+- Stage 2.2C public-beta hardening: non-consuming `doctor` CLI with durable
+  stable vs live experimental capability tiers; explicit named-profile probes,
+  `--all-profiles`, `--require-live` and JSON output; missing named-profile
+  keys fail closed without borrowing the default key.
+- GitHub Actions CI across Python 3.11/3.12/3.13 plus a separate package gate
+  that builds wheel + sdist, installs the wheel into a fresh venv and performs
+  a real MCP stdio handshake/health smoke from the installed console script.
+- Public registry schema version 1 via SQLite `user_version`: legacy v0 state
+  is promoted after additive migration, while future unsupported schema
+  versions fail closed.
+- MIT license, beta package metadata and public compatibility/support-tier docs.
+
 - First-class multi-profile routing (Stage 2.2B): Hermes profile identity is
   now a first-class bridge routing and security boundary. Lane bindings are
   profile-aware (`(profile, lane) -> stored_session_id`), the same lane name

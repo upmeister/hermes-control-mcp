@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import json
+import os
 import asyncio
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 from urllib.parse import urlparse
 
-from hermes_zcode_bridge.api import APIError, APIResponse, HermesAPIClient
-from hermes_zcode_bridge.config import BridgeConfig, ConfigError
-from hermes_zcode_bridge.registry import StateRegistry
-from hermes_zcode_bridge.service import BridgeService
+from hermes_control_mcp.api import APIError, APIResponse, HermesAPIClient
+from hermes_control_mcp.config import BridgeConfig, ConfigError, default_state_db
+from hermes_control_mcp.registry import REGISTRY_SCHEMA_VERSION, RegistryError, StateRegistry
+from hermes_control_mcp.service import BridgeService
 
 
 class FakeTransport:
@@ -75,6 +77,64 @@ class BridgeContractTests(unittest.TestCase):
             saved = reopened.request_by_id("req-1")
             self.assertEqual(saved["run_id"], "run-1")
             self.assertNotIn("prompt", saved)
+
+    def test_registry_promotes_legacy_user_version_zero_to_public_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.db"
+            raw = sqlite3.connect(path)
+            raw.execute("PRAGMA user_version=0")
+            raw.close()
+
+            registry = StateRegistry(path)
+            self.addCleanup(registry.close)
+            self.assertEqual(registry.schema_version, REGISTRY_SCHEMA_VERSION)
+
+            verify = sqlite3.connect(path)
+            self.addCleanup(verify.close)
+            version = int(verify.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(version, REGISTRY_SCHEMA_VERSION)
+
+    def test_registry_refuses_future_schema_version(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.db"
+            raw = sqlite3.connect(path)
+            raw.execute(f"PRAGMA user_version={REGISTRY_SCHEMA_VERSION + 1}")
+            raw.commit()
+            raw.close()
+
+            with self.assertRaisesRegex(RegistryError, "newer than supported"):
+                StateRegistry(path)
+
+    def test_default_state_path_prefers_new_public_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("XDG_STATE_HOME")
+            os.environ["XDG_STATE_HOME"] = tmp
+            self.addCleanup(
+                lambda: os.environ.__setitem__("XDG_STATE_HOME", old)
+                if old is not None
+                else os.environ.pop("XDG_STATE_HOME", None)
+            )
+            expected = Path(tmp) / "hermes-control-mcp" / "bridge.db"
+            self.assertEqual(default_state_db(), expected)
+
+    def test_default_state_path_reuses_legacy_db_when_new_db_is_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("XDG_STATE_HOME")
+            os.environ["XDG_STATE_HOME"] = tmp
+            self.addCleanup(
+                lambda: os.environ.__setitem__("XDG_STATE_HOME", old)
+                if old is not None
+                else os.environ.pop("XDG_STATE_HOME", None)
+            )
+            legacy = Path(tmp) / "hermes-zcode-bridge" / "bridge.db"
+            legacy.parent.mkdir(parents=True)
+            legacy.touch()
+            self.assertEqual(default_state_db(), legacy)
+
+            preferred = Path(tmp) / "hermes-control-mcp" / "bridge.db"
+            preferred.parent.mkdir(parents=True)
+            preferred.touch()
+            self.assertEqual(default_state_db(), preferred)
 
     def test_start_sends_explicit_session_and_structured_result(self):
         def handler(method, url, headers, body, timeout):
@@ -342,7 +402,7 @@ class ConfigContractTests(unittest.TestCase):
 
 class MCPContractTests(unittest.TestCase):
     def test_mcp_surface_is_allowlisted(self):
-        from hermes_zcode_bridge.mcp_server import create_server
+        from hermes_control_mcp.mcp_server import create_server
 
         with tempfile.TemporaryDirectory() as tmp:
             config = BridgeConfig(api_url="http://bridge.test", api_key="x", state_db=Path(tmp) / "state.db")
@@ -369,7 +429,7 @@ class MCPContractTests(unittest.TestCase):
         self.assertNotIn("cli_exec", names)
 
     def test_live_session_id_descriptions_separate_stored_and_runtime_namespaces(self):
-        from hermes_zcode_bridge.mcp_server import create_server
+        from hermes_control_mcp.mcp_server import create_server
 
         with tempfile.TemporaryDirectory() as tmp:
             config = BridgeConfig(api_url="http://bridge.test", api_key="x", state_db=Path(tmp) / "state.db")

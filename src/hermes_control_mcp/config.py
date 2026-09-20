@@ -30,7 +30,13 @@ def default_profiles_root() -> Path:
 
 def default_state_db() -> Path:
     state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")).expanduser()
-    return state_home / "hermes-zcode-bridge" / "bridge.db"
+    preferred = state_home / "hermes-control-mcp" / "bridge.db"
+    legacy = state_home / "hermes-zcode-bridge" / "bridge.db"
+    # Reuse the historical private-deployment path only when the new public
+    # path does not exist, avoiding an accidental empty registry after rename.
+    if not preferred.exists() and legacy.exists():
+        return legacy
+    return preferred
 
 
 def read_env_value(path: Path, key: str) -> str | None:

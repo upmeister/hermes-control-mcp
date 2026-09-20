@@ -1,4 +1,4 @@
-# hermes-zcode-bridge
+# Hermes MCP Control Plane
 
 An experimental MCP control plane for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
@@ -7,7 +7,7 @@ The project started as a ZCode integration, but the bridge itself is an MCP stdi
 - **Durable runs** over the Hermes API Server for idempotent, detachable work.
 - **Live shared sessions** for attaching to the same Hermes TUI/Desktop runtime without creating a second session authority.
 
-> **Project status:** Stage 2.2A is merged after independent review. The bridge now has the Stage 2.1 shared-turn safety model plus actionable wait→reconcile recovery and a bounded retry for Hermes' transient resume race. Stage 2.2B is the current implementation milestone: make Hermes profile identity first-class across lanes, durable API routing and live resume/control. The project is not public-release-ready yet: live owner attach still depends on an out-of-tree Hermes seam, and packaging/release hardening follows multi-profile correctness.
+> **Project status:** Stage 2.2B + 2.2B.1 multi-profile correctness are merged and deployed. Stage 2.2C is the public-beta hardening pass: packaging, CI, a non-consuming doctor, compatibility tiers and release hygiene. The public beta treats the durable API control plane as the stable stock-Hermes core; shared Desktop/TUI live attach remains optional/experimental until Hermes exposes a supported equivalent native attach seam.
 
 ## Why this exists
 
@@ -22,7 +22,7 @@ MCP client
    |
    | stdio (locally or over SSH)
    v
-hermes-zcode-bridge
+hermes-control-mcp
    |
    +-- durable plane --> Hermes API Server --> /v1/runs, history, status, control
    |
@@ -149,24 +149,61 @@ The bridge does **not** reuse Dashboard cookies, browser refresh tokens, public 
 
 The current owner adapter is an out-of-tree Hermes integration and remains opt-in/default-disabled. The long-term goal is to converge on a supported upstream machine/native attach seam rather than permanently maintaining a private transport fork. See [ADR-0001](docs/adr/0001-local-owner-attach.md) and [Upstream research](docs/UPSTREAM-HERMES.md).
 
+## Public-beta capability tiers
+
+| Capability | Status |
+|---|---|
+| Durable Runs API / status / history / control | **Stable** |
+| Durable multi-profile routing | **Stable** |
+| Shared live Desktop/TUI attach | **Experimental / optional** |
+| Interactive approvals / clarify | Not implemented |
+| Streamable HTTP MCP | Not implemented |
+
+A missing live owner/native attach seam does **not** make the default public-beta readiness check fail. Users who depend on shared live attach can require it explicitly.
+
+See [Compatibility and support tiers](docs/COMPATIBILITY.md).
+
 ## Running from source
 
-Python 3.11+ is required.
+Python 3.11–3.13 are supported by the public-beta CI matrix.
 
 ~~~bash
-git clone https://github.com/upmeister/hermes-zcode-bridge.git
-cd hermes-zcode-bridge
+git clone https://github.com/upmeister/hermes-control-mcp.git
+cd hermes-control-mcp
 
 python -m venv .venv
 . .venv/bin/activate
 pip install -e .
 ~~~
 
-The package exposes:
+The public package and primary CLI are:
 
 ~~~bash
-hermes-zcode-bridge --help
+hermes-control-mcp --help
 ~~~
+
+The Python import package is `hermes_control_mcp`. Existing private deployments
+may temporarily keep the legacy `hermes-zcode-bridge` console alias during the
+beta rename, but new configuration should use `hermes-control-mcp`.
+
+### Readiness doctor
+
+Run non-consuming readiness checks before wiring the bridge into an MCP host:
+
+~~~bash
+hermes-control-mcp doctor
+hermes-control-mcp doctor --profile coder
+hermes-control-mcp doctor --all-profiles
+hermes-control-mcp doctor --json
+~~~
+
+The default gate checks the durable core and requested named profiles while treating live attach as optional. To require the shared live tier:
+
+~~~bash
+hermes-control-mcp doctor --require-live
+~~~
+
+Doctor never submits an LLM run/prompt or mutates Hermes configuration.
 
 A typical stdio MCP client launches the bridge as a long-lived process. If Hermes runs on another machine, SSH can wrap the process once for the lifetime of the MCP connection:
 
@@ -178,9 +215,9 @@ A typical stdio MCP client launches the bridge as a long-lived process. If Herme
       "args": [
         "-T",
         "hermes-host",
-        "/path/to/hermes-zcode-bridge/.venv/bin/hermes-zcode-bridge",
+        "/path/to/hermes-control-mcp/.venv/bin/hermes-control-mcp",
         "--state-db",
-        "~/.local/state/hermes-zcode-bridge/bridge.db"
+        "~/.local/state/hermes-control-mcp/bridge.db"
       ]
     }
   }
@@ -192,11 +229,11 @@ Secrets should stay on the Hermes host. Do not place API keys, Dashboard credent
 Live owner attach additionally requires a compatible owner-adapter lease:
 
 ~~~bash
-hermes-zcode-bridge \
+hermes-control-mcp \
   --gateway-owner-lease "$HERMES_HOME/runtime/owner_adapter/owner_adapter.json"
 ~~~
 
-This is currently an integration/development setup, not yet the recommended public installation path.
+This live path is optional/experimental for the public beta. Stock Hermes v0.21.3 does not ship the project's private owner-adapter seam; the bridge roadmap tracks upstream native/session-authority work and will migrate when a supported equivalent lands.
 
 ## Tests
 
@@ -204,7 +241,7 @@ This is currently an integration/development setup, not yet the recommended publ
 ./scripts/test.sh
 python3 -m unittest discover -s tests -v
 python3 -m compileall -q src
-python3 -m py_compile src/hermes_zcode_bridge/*.py
+python3 -m py_compile src/hermes_control_mcp/*.py
 ~~~
 
 The project uses deterministic fake transports for most protocol tests plus real WebSocket/UDS smoke coverage where transport behavior matters.
@@ -218,6 +255,7 @@ The project uses deterministic fake transports for most protocol tests plus real
 - **Stage 2.1** — shared-turn attribution hardening, replay conservatism, boundary-aware reconciliation, and atomic live request reservation.
 - **Stage 2.2A** — actionable conservative wait recovery plus one bounded retry for Hermes' exact transient `4007 "session no longer live; retry resume"` race. Merged as `999ccff`; independent review: PASS.
 - **Stage 2.2B** — first-class multi-profile routing: profile-aware lane/request registry with safe legacy migration, profile-scoped live create/resume/control across restart and reconnect, durable `/p/<profile>/...` routing with per-profile credentials, and fail-closed ambiguity/conflict handling.
+- **Stage 2.2B.1** — omitted-profile inference follows existing exact/local identity before defaulting, eliminating silent named→default admission drift.
 
 ### Next: Stage 2.2 — public-beta foundation
 
@@ -225,7 +263,7 @@ Stage 2.2 is intentionally split into bounded PRs:
 
 1. **Lifecycle recovery — complete (Stage 2.2A).** Conservative wait results persist reconcilable state; bounded single retry for Hermes' transient resume race; genuine missing sessions stay fail-closed.
 2. **First-class multi-profile routing — complete (Stage 2.2B).** Profile is part of durable lane identity, survives restart/resume, scopes every live TUI call, and routes durable API work through Hermes `/p/<profile>/...` with the profile's own API key.
-3. **Public packaging/hardening — next (Stage 2.2C).** Client-neutral naming/docs, clean-install smoke, CI/release metadata, registry schema ownership and generic examples.
+3. **Public packaging/hardening — in progress (Stage 2.2C).** Doctor/preflight, Python 3.11–3.13 CI, clean installed-wheel MCP smoke, MIT licensing, registry schema v1 ownership, compatibility tiers and final package naming.
 
 Research gates run alongside implementation:
 
@@ -274,9 +312,21 @@ After the bridge has a public beta and the upstream session-authority direction 
 
 Until then, keeping the bridge standalone lets it iterate quickly without coupling its release cadence to Hermes core.
 
+## State database ownership
+
+The public-beta registry schema is versioned. Legacy unversioned databases are migrated additively to schema v1; a database created by a newer unsupported bridge fails closed.
+
+Public-beta process contract: **one bridge process owns one `--state-db` at a time**. Use separate state DB paths for independent bridge processes.
+
+## Hermes multiplexing note
+
+Explicit Hermes multiplexing may activate configured platform adapters across multiple live profiles. On old installations, copied Telegram/Discord/etc. credentials can therefore surface duplicate-credential conflicts during gateway startup. The bridge detects readiness but deliberately does not rewrite Hermes profile topology or adapter configuration. See [COMPATIBILITY.md](docs/COMPATIBILITY.md).
+
 ## Documentation
 
 - [Stage 2.2 roadmap](docs/ROADMAP.md)
+- [Compatibility and public-beta tiers](docs/COMPATIBILITY.md)
+- [Stage 2.2C release contract](docs/STAGE-2.2C-IMPLEMENTATION-BRIEF.md)
 - [Current Stage 2.2B coding contract](docs/STAGE-2.2B-IMPLEMENTATION-BRIEF.md)
 - [Historical Stage 2.2A implementation brief](docs/STAGE-2.2-IMPLEMENTATION-BRIEF.md)
 - [Hermes upstream research](docs/UPSTREAM-HERMES.md)
@@ -290,4 +340,6 @@ Read [AGENTS.md](AGENTS.md) before changing behavior. It defines the current sco
 
 ## License and public release
 
-A public release still needs an explicit license decision and release metadata. Until that is done, treat this repository as pre-public engineering work rather than a finished third-party distribution.
+MIT License. See [LICENSE](LICENSE).
+
+Stage 2.2C prepares the repository for a public beta but does not itself publish to PyPI. The confirmed public distribution/repository/CLI slug is `hermes-control-mcp`; the GitHub repository will be renamed after this release-hardening PR merges.

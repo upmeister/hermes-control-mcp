@@ -1,4 +1,4 @@
-# hermes-zcode-bridge — project contract
+# hermes-control-mcp — project contract
 
 ## Purpose and boundaries
 
@@ -31,14 +31,16 @@ upstream/API research.
 - Stage 2: complete — private owner attach to one existing live runtime.
 - Stage 2.1: complete — live attribution/replay/reconciliation hardening and
   atomic live request reservation.
-- Stage 2.2A: complete — actionable conservative recovery and bounded transient
-  4007 resume retry; merged as `999ccff` after adversarial + independent review.
-- Next coding PR: **Stage 2.2B first-class multi-profile routing**, defined
-  exactly in `docs/STAGE-2.2B-IMPLEMENTATION-BRIEF.md`.
+- Stage 2.2A: complete — lifecycle recovery.
+- Stage 2.2B: complete — first-class multi-profile routing.
+- Stage 2.2B.1: complete — omitted-profile admission inference follows existing
+  identity before defaulting.
+- Current milestone: **Stage 2.2C public-beta hardening**, defined in
+  `docs/STAGE-2.2C-IMPLEMENTATION-BRIEF.md`.
 
-Do not silently fold Streamable HTTP MCP, interactive server requests, public
-package release, cross-platform IPC or Agent Sessions migration into the 2.2B
-PR. Those are separate review/research boundaries.
+Stage 2.2C may change packaging, CI, diagnostics, docs and registry schema
+version metadata. It must not add HTTP MCP, interactive approvals, new Hermes
+runtime authority or Agent Sessions migration.
 
 ## Source of truth
 
@@ -47,8 +49,10 @@ architecture:
 
 - `README.md` — public-facing architecture/status;
 - `docs/ROADMAP.md` — milestone plan;
-- `docs/STAGE-2.2B-IMPLEMENTATION-BRIEF.md` — exact current coding contract;
+- `docs/STAGE-2.2C-IMPLEMENTATION-BRIEF.md` — current release-hardening contract;
+- `docs/STAGE-2.2B-IMPLEMENTATION-BRIEF.md` — historical multi-profile contract;
 - `docs/STAGE-2.2-IMPLEMENTATION-BRIEF.md` — historical Stage 2.2A contract;
+- `docs/COMPATIBILITY.md` — public support tiers and prerequisites;
 - `docs/UPSTREAM-HERMES.md` — dated upstream research snapshot;
 - `docs/API-SERVER-PARITY-SPIKE.md` — research protocol;
 - `docs/DISTRIBUTION-AND-UPSTREAMING.md` — packaging/upstream strategy;
@@ -211,8 +215,9 @@ Primary public distribution is expected to remain a standalone Python package /
 isolated runner because the MCP client owns bridge process lifetime. A Hermes
 plugin may later be a companion installer/discovery/configuration layer.
 
-Do not add plugin manifests, PyPI publication, `uvx` claims, release workflows
-or license declarations without an explicit release-scoped PR.
+Stage 2.2C is the explicit release-scoped PR: CI, package metadata, MIT license,
+doctor diagnostics and clean-installed-artifact checks are in scope. Actual
+PyPI publication remains a separate maintainer action.
 
 ## Checks
 
@@ -222,7 +227,7 @@ Run at minimum:
 ./scripts/test.sh
 python3 -m unittest discover -s tests -v
 python3 -m compileall -q src
-python3 -m py_compile src/hermes_zcode_bridge/*.py
+python3 -m py_compile src/hermes_control_mcp/*.py
 git diff --check
 ~~~
 

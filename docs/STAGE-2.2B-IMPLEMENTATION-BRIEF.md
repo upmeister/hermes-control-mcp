@@ -499,13 +499,13 @@ Those remain separate milestones/research.
 Expected:
 
 ~~~text
-src/hermes_zcode_bridge/config.py
-src/hermes_zcode_bridge/api.py
-src/hermes_zcode_bridge/registry.py
-src/hermes_zcode_bridge/service.py
-src/hermes_zcode_bridge/live_service.py
-src/hermes_zcode_bridge/mcp_server.py
-src/hermes_zcode_bridge/server.py
+src/hermes_control_mcp/config.py
+src/hermes_control_mcp/api.py
+src/hermes_control_mcp/registry.py
+src/hermes_control_mcp/service.py
+src/hermes_control_mcp/live_service.py
+src/hermes_control_mcp/mcp_server.py
+src/hermes_control_mcp/server.py
 tests/test_*.py
 README.md
 CHANGELOG.md
@@ -523,7 +523,7 @@ Before review:
 ./scripts/test.sh
 python3 -m unittest discover -s tests -v
 python3 -m compileall -q src
-python3 -m py_compile src/hermes_zcode_bridge/*.py
+python3 -m py_compile src/hermes_control_mcp/*.py
 git diff --check
 ~~~
 
