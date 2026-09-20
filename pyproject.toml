@@ -4,15 +4,33 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-zcode-bridge"
-version = "0.1.0"
-description = "A small MCP stdio bridge to Hermes Agent's durable runs API"
+version = "0.2.0b1"
+description = "MCP control plane for Hermes Agent durable runs and optional shared live sessions"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
+license = {file = "LICENSE"}
+keywords = ["hermes-agent", "mcp", "model-context-protocol", "agents", "automation"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development",
+]
 dependencies = [
   "mcp>=2.0,<3",
   "httpx>=0.28.1,<1",
   "websockets>=15,<16",
 ]
+
+[project.urls]
+Repository = "https://github.com/upmeister/hermes-zcode-bridge"
+Issues = "https://github.com/upmeister/hermes-zcode-bridge/issues"
+Documentation = "https://github.com/upmeister/hermes-zcode-bridge#readme"
 
 [project.scripts]
 hermes-zcode-bridge = "hermes_zcode_bridge.server:main"
