@@ -275,12 +275,12 @@ class DurableProfileRoutingTests(unittest.TestCase):
             self.assertEqual(result["error_code"], "profile_route_config_error")
             self.assertEqual(transport.calls, [])
 
-    def test_same_request_id_across_profiles_conflicts(self):
+    def test_explicit_request_profile_mismatch_conflicts_but_omission_infers_exact_request(self):
         seen: list[str] = []
 
         def handler(method, url, headers, body, timeout):
             seen.append(urlparse(url).path)
-            return response(202, {"run_id": "run-1", "status": "started", "replayed": False})
+            return response(202, {"run_id": f"run-{len(seen)}", "status": "started", "replayed": False})
 
         service, _ = self.make_service(handler, profiles={"coder": NAMED_KEY})
         first = service.start(lane="lane-a", prompt="inspect", request_id="req-1")
@@ -289,14 +289,83 @@ class DurableProfileRoutingTests(unittest.TestCase):
         self.assertFalse(second["ok"])
         self.assertEqual(second["error_code"], "request_profile_conflict")
         self.assertFalse(second["replayed"])
-        # The reverse direction conflicts too; nothing was resubmitted.
-        self.assertEqual(seen, ["/v1/runs"])
-        third = service.start(lane="lane-a", prompt="inspect", request_id="req-2", profile="coder")
+
+        third = service.start(lane="lane-a", prompt="named", request_id="req-2", profile="coder")
         self.assertTrue(third["ok"])
-        fourth = service.start(lane="lane-a", prompt="inspect", request_id="req-2")
+        fourth = service.start(lane="lane-a", prompt="named", request_id="req-2", profile="default")
         self.assertFalse(fourth["ok"])
         self.assertEqual(fourth["error_code"], "request_profile_conflict")
-        self.assertEqual(seen, ["/v1/runs", "/p/coder/v1/runs"])
+
+        # Make the lane itself ambiguous. Exact request identity still owns the
+        # omitted-profile replay and must not silently choose default.
+        default_other = service.start(lane="lane-a", prompt="default-other", request_id="req-3", profile="default")
+        self.assertTrue(default_other["ok"])
+        replay = service.start(lane="lane-a", prompt="named", request_id="req-2")
+        self.assertTrue(replay["ok"])
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["profile"], "coder")
+        self.assertEqual(replay["request_id"], "req-2")
+        self.assertEqual(seen, ["/v1/runs", "/p/coder/v1/runs", "/v1/runs"])
+
+    def test_run_start_omitted_profile_infers_single_named_lane(self):
+        seen: list[str] = []
+
+        def handler(method, url, headers, body, timeout):
+            seen.append(urlparse(url).path)
+            return response(202, {"run_id": f"run-{len(seen)}", "status": "started", "replayed": False})
+
+        service, _ = self.make_service(handler, profiles={"coder": NAMED_KEY})
+        first = service.start(lane="work", prompt="first", request_id="req-1", profile="coder")
+        self.assertTrue(first["ok"])
+
+        second = service.start(lane="work", prompt="second", request_id="req-2")
+        self.assertTrue(second["ok"])
+        self.assertEqual(second["profile"], "coder")
+        self.assertEqual(seen, ["/p/coder/v1/runs", "/p/coder/v1/runs"])
+        self.assertEqual(service.registry.profiles_for_lane("work"), ["coder"])
+
+    def test_run_start_omitted_profile_fails_closed_when_lane_is_shared(self):
+        seen: list[str] = []
+
+        def handler(method, url, headers, body, timeout):
+            seen.append(urlparse(url).path)
+            return response(202, {"run_id": f"run-{len(seen)}", "status": "started", "replayed": False})
+
+        service, _ = self.make_service(handler, profiles={"coder": NAMED_KEY})
+        self.assertTrue(service.start(lane="shared", prompt="d", request_id="req-d", profile="default")["ok"])
+        self.assertTrue(service.start(lane="shared", prompt="c", request_id="req-c", profile="coder")["ok"])
+        calls_before = list(seen)
+
+        ambiguous = service.start(lane="shared", prompt="must-not-route", request_id="req-x")
+        self.assertFalse(ambiguous["ok"])
+        self.assertEqual(ambiguous["error_code"], "lane_profile_ambiguous")
+        self.assertEqual(seen, calls_before)
+
+    def test_run_start_known_session_infers_named_profile_on_new_lane(self):
+        seen: list[str] = []
+
+        def handler(method, url, headers, body, timeout):
+            seen.append(urlparse(url).path)
+            return response(202, {
+                "run_id": f"run-{len(seen)}",
+                "session_id": "stored-coder" if len(seen) == 1 else "stored-coder",
+                "status": "started",
+                "replayed": False,
+            })
+
+        service, _ = self.make_service(handler, profiles={"coder": NAMED_KEY})
+        first = service.start(lane="origin", prompt="first", request_id="req-1", profile="coder")
+        self.assertTrue(first["ok"])
+        self.assertEqual(first["session_id"], "stored-coder")
+
+        attached = service.start(
+            lane="new-lane", prompt="continue", request_id="req-2", session_id="stored-coder"
+        )
+        self.assertTrue(attached["ok"])
+        self.assertEqual(attached["profile"], "coder")
+        self.assertEqual(seen, ["/p/coder/v1/runs", "/p/coder/v1/runs"])
+        self.assertEqual(service.registry.session_for_profile_lane("coder", "new-lane"), "stored-coder")
+        self.assertIsNone(service.registry.session_for_profile_lane("default", "new-lane"))
 
     def test_profile_participates_in_request_fingerprint(self):
         body = {"input": "inspect"}
@@ -446,6 +515,50 @@ class LiveProfileTests(unittest.TestCase):
         self.assertEqual(resumed["profile"], "coder")
         resume = next(f for f in self.frames(gateway2) if f["method"] == "session.resume")
         self.assertEqual(resume["params"], {"session_id": "stored-1", "profile": "coder"})
+
+    def test_known_named_session_on_new_lane_infers_profile(self):
+        service, registry, gateway = self.make_service()
+        opened = service.open(lane="origin", profile="coder")
+        self.assertTrue(opened["ok"])
+        stored = opened["stored_session_id"]
+        self.assertEqual(registry.profiles_for_session(stored), ["coder"])
+
+        resumed = service.open(lane="other", session_id=stored)
+        self.assertTrue(resumed["ok"])
+        self.assertEqual(resumed["profile"], "coder")
+        resumes = [f for f in self.all_frames(gateway) if f["method"] == "session.resume"]
+        self.assertTrue(resumes)
+        self.assertEqual(resumes[-1]["params"], {"session_id": stored, "profile": "coder"})
+        self.assertEqual(registry.session_for_profile_lane("coder", "other"), stored)
+        self.assertIsNone(registry.session_for_profile_lane("default", "other"))
+
+    def test_live_duplicate_request_omission_infers_exact_profile_even_on_shared_lane(self):
+        service, _, gateway = self.make_service()
+        self.assertTrue(service.open(lane="work", profile="coder")["ok"])
+        first = service.prompt(lane="work", text="named prompt", request_id="live-named", wait_seconds=0)
+        self.assertTrue(first["ok"])
+        self.assertEqual(first["profile"], "coder")
+        submits_before = len([f for f in self.all_frames(gateway) if f["method"] == "prompt.submit"])
+
+        # Make lane-only routing ambiguous after the request already exists.
+        self.assertTrue(service.open(lane="work", profile="default")["ok"])
+        replay = service.prompt(lane="work", text="named prompt", request_id="live-named", wait_seconds=0)
+        self.assertTrue(replay["ok"])
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["profile"], "coder")
+        submits_after = len([f for f in self.all_frames(gateway) if f["method"] == "prompt.submit"])
+        self.assertEqual(submits_after, submits_before)
+
+        conflict = service.prompt(
+            lane="work", text="named prompt", request_id="live-named",
+            wait_seconds=0, profile="default",
+        )
+        self.assertFalse(conflict["ok"])
+        self.assertEqual(conflict["error_code"], "request_profile_conflict")
+        self.assertEqual(
+            len([f for f in self.all_frames(gateway) if f["method"] == "prompt.submit"]),
+            submits_before,
+        )
 
     def test_transient_4007_retry_preserves_session_id_and_profile(self):
         service, _, gateway = self.make_service()

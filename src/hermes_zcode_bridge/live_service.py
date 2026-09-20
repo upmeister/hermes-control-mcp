@@ -9,7 +9,7 @@ from typing import Any
 from .live_client import LiveAuthError, LiveError, LiveGatewayClient, LiveRPCError, LiveTransportUnknown
 from .profiles import DEFAULT_PROFILE
 from .registry import StateRegistry
-from .service import InputError, _fingerprint, _profile_input, _validate_text, _visible_id
+from .service import InputError, _fingerprint, _optional_profile, _profile_input, _validate_text, _visible_id
 
 
 class LiveService:
@@ -229,6 +229,33 @@ class LiveService:
             )
         return (bound[0] if bound else DEFAULT_PROFILE), None
 
+    def _open_profile(
+        self, lane: str, profile: str | None, supplied_session: str | None
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Resolve live-open profile, allowing an exact known stored session to infer it.
+
+        A supplied profile is always explicit. When omitted, an exact stored
+        session known under one profile outranks lane/default inference. An
+        ambiguous exact session fails closed rather than guessing.
+        """
+        supplied_profile = _optional_profile(profile)
+        if supplied_profile is not None:
+            return supplied_profile, None
+        if supplied_session:
+            session_profiles = sorted(
+                set(self.registry.profiles_for_session(supplied_session))
+                | set(self.registry.profiles_for_request_session(supplied_session))
+            )
+            if len(session_profiles) > 1:
+                return DEFAULT_PROFILE, self._result(
+                    status="failed", error_code="lane_profile_ambiguous",
+                    error=(f"The supplied stored session is locally known under multiple profiles "
+                           f"{session_profiles}; supply an explicit profile"),
+                )
+            if len(session_profiles) == 1:
+                return session_profiles[0], None
+        return self._lane_profile(lane, None)
+
     def _runtime_for_lane(
         self, profile: str, lane: str, supplied: str | None = None, *, reopen: bool = False
     ) -> tuple[str | None, dict[str, Any] | None]:
@@ -293,10 +320,10 @@ class LiveService:
     ) -> dict[str, Any]:
         try:
             lane = _validate_text(lane, "lane", max_length=200)
-            profile, profile_error = self._lane_profile(lane, profile)
+            supplied = _visible_id(session_id, "session_id") if session_id else None
+            profile, profile_error = self._open_profile(lane, profile, supplied)
             if profile_error is not None:
                 return profile_error
-            supplied = _visible_id(session_id, "session_id") if session_id else None
             current = self.registry.session_for_profile_lane(profile, lane)
             if supplied and current and supplied != current:
                 return self._result(
@@ -379,13 +406,36 @@ class LiveService:
             if not text.strip():
                 raise InputError("text must not be blank")
             wait = max(0.0, min(float(wait_seconds), 3600.0))
-            profile, profile_error = self._lane_profile(lane, profile)
-            if profile_error is not None:
-                return profile_error
+            supplied_profile = _optional_profile(profile)
+            request_id = _visible_id(request_id, "request_id", max_length=128) if request_id else f"live_req_{uuid.uuid4().hex}"
+            existing_request = self.registry.live_request_by_id(request_id)
+            if existing_request is not None:
+                record_profile = str(existing_request.get("profile") or DEFAULT_PROFILE)
+                if str(existing_request.get("lane") or "") != lane:
+                    return self._result(
+                        status="failed", request_id=request_id,
+                        session_id=existing_request.get("runtime_session_id"),
+                        stored_session_id=existing_request.get("session_id"),
+                        profile=record_profile, error_code="request_id_conflict",
+                        error="request_id was already used for a different live lane",
+                    )
+                if supplied_profile is not None and supplied_profile != record_profile:
+                    return self._result(
+                        status="failed", request_id=request_id,
+                        session_id=existing_request.get("runtime_session_id"),
+                        stored_session_id=existing_request.get("session_id"),
+                        profile=record_profile, error_code="request_profile_conflict",
+                        error=(f"request_id was already used under profile {record_profile!r}; "
+                               "profile boundaries are never rerouted"),
+                    )
+                profile = record_profile
+            else:
+                profile, profile_error = self._lane_profile(lane, supplied_profile)
+                if profile_error is not None:
+                    return profile_error
             runtime, error = self._runtime_for_lane(profile, lane, session_id)
             if error is not None:
                 return error
-            request_id = _visible_id(request_id, "request_id", max_length=128) if request_id else f"live_req_{uuid.uuid4().hex}"
             durable_session = self.registry.session_for_profile_lane(profile, lane) or self._stored_by_runtime.get(runtime or "") or runtime
             fingerprint = _fingerprint(lane, {
                 "session_id": durable_session, "text": text, "queued": bool(queued),
