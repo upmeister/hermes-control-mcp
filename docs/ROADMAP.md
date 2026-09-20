@@ -152,23 +152,46 @@ profile routing if it can be done without weakening secret isolation.
 
 ### Stage 2.2C — public package hardening
 
-Priority: after 2.2A/2.2B semantics settle.
+Status: **IN PROGRESS**.
+
+Behavioral base includes Stage 2.2B.1 omitted-profile inference fix
+`0d5b8be`.
+
+Accepted public-beta model:
+
+~~~text
+durable core = stable / stock supported Hermes
+live shared-session attach = experimental / optional
+~~~
+
+Priority: current milestone.
 
 Target work:
 
 - client-neutral README/examples;
+- non-consuming `doctor` readiness command;
+- stable durable vs experimental live capability tiers;
 - package metadata suitable for a public Python release;
-- explicit license;
-- CI on supported Python versions;
-- wheel + sdist clean-install smoke;
+- MIT license;
+- CI on Python 3.11/3.12/3.13;
+- wheel + sdist clean-install MCP stdio smoke;
 - isolated runner/uvx-style invocation if packaging supports it;
-- registry schema/version migration ownership;
+- public registry schema v1 ownership;
+- documented one-process-per-state-db contract;
 - generic configuration examples without private hostnames or local paths;
 - release versioning and changelog discipline;
-- explicit compatibility matrix against Hermes versions/seams.
+- explicit compatibility matrix against Hermes versions/seams;
+- final distribution/CLI naming before publication.
 
-Primary distribution remains a standalone MCP package unless research proves a
-Hermes plugin should own the runtime.
+Primary distribution remains a standalone MCP package. A Hermes plugin may
+later act as an installer/discovery companion; it does not own the stdio runtime
+in the public beta.
+
+Deployment lessons from the production multi-profile rollout are treated as
+release prerequisites rather than a new runtime fix: doctor/compatibility docs
+must detect or explain missing named-profile keys, unserved profiles, stale
+owner attach and legacy multiplex adapter conflicts. The bridge does not mutate
+Hermes topology to repair them.
 
 ## Parallel research gates
 
