@@ -89,6 +89,23 @@ Also verify:
 - README install instructions point at the released package;
 - no credential values appear in release logs.
 
+## Recover a GitHub Release after PyPI already succeeded
+
+If PyPI publication succeeds but the final GitHub Release job fails, do **not**
+rerun the PyPI publish step and do not rebuild the package.
+
+Use the manual `release` workflow recovery mode:
+
+1. open **Actions → release → Run workflow** on `main`;
+2. set `release_tag` to the already-published tag, for example `v0.2.0b1`;
+3. set `source_run_id` to the original release workflow run that produced the
+   verified `release-dist` artifact;
+4. run the workflow.
+
+Recovery downloads the original verified wheel/sdist/release notes from that run,
+verifies the tag exists and no GitHub Release already exists, then creates only
+the GitHub Release.
+
 ## If publishing fails
 
 Do not reuse a version with different contents after any distribution file has reached PyPI.

@@ -4,6 +4,16 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to recover (for example v0.2.0b1)"
+        required: true
+        type: string
+      source_run_id:
+        description: "Successful/partially successful release workflow run that owns release-dist"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -14,6 +24,7 @@ concurrency:
 
 jobs:
   build:
+    if: github.event_name == 'push'
     name: build and verify release artifacts
     runs-on: ubuntu-latest
 
@@ -102,6 +113,7 @@ jobs:
           retention-days: 7
 
   pypi-publish:
+    if: github.event_name == 'push'
     name: publish to PyPI
     needs: build
     runs-on: ubuntu-latest
@@ -121,6 +133,7 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
 
   github-release:
+    if: github.event_name == 'push'
     name: create GitHub Release
     needs: pypi-publish
     runs-on: ubuntu-latest
@@ -143,6 +156,57 @@ jobs:
             extra+=(--prerelease)
           fi
           gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Hermes MCP Control Plane $version" \
+            --notes-file release-notes.md \
+            "${extra[@]}"
+
+  recover-github-release:
+    if: github.event_name == 'workflow_dispatch'
+    name: recover GitHub Release from verified artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Download verified artifacts from original release run
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Validate recovery inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          test -f release-notes.md
+          test -d dist
+          test -n "$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          test -n "$(find dist -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" >/dev/null
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "GitHub Release $RELEASE_TAG already exists; refusing to overwrite it."
+            exit 1
+          fi
+
+      - name: Create GitHub Release from original verified distributions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          extra=()
+          if [[ "$version" =~ (a|b|rc|dev)[0-9]+ ]]; then
+            extra+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
             --title "Hermes MCP Control Plane $version" \
             --notes-file release-notes.md \
             "${extra[@]}"
