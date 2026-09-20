@@ -32,20 +32,36 @@ See [Compatibility](docs/COMPATIBILITY.md) for the exact boundary.
 
 ## Install
 
-Python 3.11–3.13 is supported.
+Python 3.11–3.14 is supported.
+
+For a CLI application, an isolated tool environment is the recommended install:
 
 ~~~bash
-pip install hermes-control-mcp
+uv tool install hermes-control-mcp
 ~~~
 
-Or from source:
+If you prefer plain `pip`, install inside a virtual environment:
+
+~~~bash
+python3 -m venv ~/.venvs/hermes-control-mcp
+~/.venvs/hermes-control-mcp/bin/python -m pip install --upgrade pip
+~/.venvs/hermes-control-mcp/bin/pip install hermes-control-mcp
+~~~
+
+On Debian/Ubuntu and other PEP 668 systems, running `pip install` directly
+against the system Python may fail with `externally-managed-environment`.
+That is an operating-system packaging guard, not a Hermes MCP compatibility
+error. Do not use `sudo pip` or `--break-system-packages`; use `uv tool`,
+`pipx`, or a virtual environment instead.
+
+From source:
 
 ~~~bash
 git clone https://github.com/upmeister/hermes-control-mcp.git
 cd hermes-control-mcp
 python -m venv .venv
 . .venv/bin/activate
-pip install -e .
+python -m pip install -e .
 ~~~
 
 ## Quick start
@@ -168,7 +184,7 @@ python -m py_compile src/hermes_control_mcp/*.py
 git diff --check
 ~~~
 
-CI tests Python 3.11, 3.12, and 3.13, then builds wheel + sdist, installs the wheel into a clean virtual environment, and performs an MCP stdio smoke from the installed console entrypoint.
+CI tests Python 3.11, 3.12, 3.13, and 3.14. It also builds wheel + sdist and performs clean installed-wheel MCP smokes on the lowest and highest supported interpreters (3.11 and 3.14).
 
 ## Documentation
 

@@ -7,8 +7,8 @@ This document defines the public release process.
 - Package: `hermes-control-mcp`
 - Primary CLI: `hermes-control-mcp`
 - Python package: `hermes_control_mcp`
-- Current beta line: `0.2.0b1`
-- Tag format: `v<version>` (for example `v0.2.0b1`)
+- Current beta line: `0.2.0b2`
+- Tag format: `v<version>` (for example `v0.2.0b2`)
 
 ## One-time PyPI setup
 
@@ -53,8 +53,8 @@ Create and push the exact version tag from `main`:
 ~~~bash
 git switch main
 git pull --ff-only
-git tag -a v0.2.0b1 -m "Hermes MCP Control Plane 0.2.0b1"
-git push origin v0.2.0b1
+git tag -a v0.2.0b2 -m "Hermes MCP Control Plane 0.2.0b2"
+git push origin v0.2.0b2
 ~~~
 
 `release.yml` then:
@@ -76,7 +76,7 @@ After the workflow succeeds:
 ~~~bash
 python -m venv /tmp/hermes-control-release-check
 /tmp/hermes-control-release-check/bin/python -m pip install --upgrade pip
-/tmp/hermes-control-release-check/bin/pip install hermes-control-mcp==0.2.0b1
+/tmp/hermes-control-release-check/bin/pip install hermes-control-mcp==0.2.0b2
 /tmp/hermes-control-release-check/bin/hermes-control-mcp --help
 /tmp/hermes-control-release-check/bin/hermes-control-mcp doctor
 ~~~
@@ -97,7 +97,7 @@ rerun the PyPI publish step and do not rebuild the package.
 Use the manual `release` workflow recovery mode:
 
 1. open **Actions → release → Run workflow** on `main`;
-2. set `release_tag` to the already-published tag, for example `v0.2.0b1`;
+2. set `release_tag` to the already-published tag, for example `v0.2.0b2`;
 3. set `source_run_id` to the original release workflow run that produced the
    verified `release-dist` artifact;
 4. run the workflow.
