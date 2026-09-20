@@ -12,6 +12,37 @@ the practical public-beta pattern is to make the stdio command be `ssh` and run
 Remote Streamable HTTP MCP is a future transport boundary and is not implemented
 in the current release.
 
+## Generating the configuration with the bridge
+
+Instead of maintaining per-client shapes by hand, let the bridge render the
+right one:
+
+~~~bash
+hermes-control-mcp client-config zcode        # native ZCode mcp.servers shape
+hermes-control-mcp client-config claude-code  # mcpServers / .mcp.json shape
+hermes-control-mcp client-config cursor       # mcpServers with type = "stdio"
+hermes-control-mcp client-config codex        # TOML for ~/.codex/config.toml
+hermes-control-mcp client-config vscode       # top-level servers shape
+~~~
+
+Properties shared by every generated configuration:
+
+- stdout carries only the generated payload; guidance and warnings go to stderr;
+- the command is **non-mutating**: no client, bridge, or Hermes configuration
+  file is created or edited — redirection remains a user-owned action;
+- each config embeds an explicit **absolute per-client state DB**, so MCP hosts
+  that may run concurrently never share one bridge registry;
+- the actually installed `hermes-control-mcp` executable is preferred when
+  discoverable, so GUI-launched hosts do not depend on your interactive shell
+  PATH (a fallback emits the bare command name with a warning);
+- `--name <server-name>` renames the MCP server entry (default: `hermes`);
+- no Hermes routing flags (`--api-url`, `--env-file`, `--profiles-root`) and no
+  credential values are emitted; keys stay in the bridge process environment.
+
+The JSON/TOML examples in the rest of this document are exactly the shapes the
+command emits. Checked fixtures generated from the same renderers live under
+[`examples/client-config/`](../examples/client-config/).
+
 ## Client matrix
 
 | Client | Recommended setup surface | Local stdio shape | Remote HTTP support in client | Notes |
@@ -149,7 +180,22 @@ For multi-profile deployments, prefer keeping the bridge next to Hermes and
 making the MCP host launch it through SSH. The Hermes API keys and profile
 `.env` files never need to be copied to the client machine.
 
-First make sure the remote executable path is stable:
+The bridge automates this with one bounded read-only SSH preflight:
+
+~~~bash
+hermes-control-mcp client-config zcode --ssh hermes-host
+~~~
+
+`--ssh <host>` discovers the remote `hermes-control-mcp` executable and the
+remote home directory, then emits a config whose stdio command is
+`ssh -T <host> ...` launching the remote bridge with an explicit remote state
+DB. SSH aliases, ProxyJump, ports, and identity files keep being resolved by
+OpenSSH itself — the bridge never parses `~/.ssh/config`. When readiness has
+not been established yet, the command's stderr suggests the matching
+`ssh <host> '<bridge> doctor'` check.
+
+The steps below describe what the command does and remain useful for manual
+setups. First make sure the remote executable path is stable:
 
 ~~~bash
 ssh hermes-host 'command -v hermes-control-mcp'

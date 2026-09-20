@@ -3,10 +3,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import shlex
+import subprocess
 import sys
 from pathlib import Path
 
 from .api import HermesAPIClient
+from . import client_config
+from .client_config import (
+    CLIENT_CONFIG_DESTINATIONS,
+    DEFAULT_SERVER_NAME,
+    SUPPORTED_CLIENTS,
+)
 from .config import (
     DEFAULT_API_KEY_ENV,
     DEFAULT_API_URL,
@@ -29,8 +37,27 @@ logger = logging.getLogger("hermes_control_mcp")
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="MCP control plane for Hermes Agent durable runs and live TUI")
     parser.add_argument(
-        "command", nargs="?", default="serve", choices=("serve", "doctor"),
-        help="serve MCP over stdio (default) or run non-consuming readiness checks",
+        "command", nargs="?", default="serve", choices=("serve", "doctor", "client-config"),
+        help=(
+            "serve MCP over stdio (default), run non-consuming readiness checks (doctor), "
+            "or print a non-mutating client MCP config snippet (client-config; same-host "
+            "first, --ssh for remote Hermes hosts; no remote HTTP MCP)"
+        ),
+    )
+    parser.add_argument(
+        "client", nargs="?", default=None, choices=SUPPORTED_CLIENTS,
+        help="client-config only: which MCP host to generate configuration for",
+    )
+    parser.add_argument(
+        "--ssh", metavar="HOST", default=None,
+        help=(
+            "client-config only: launch the bridge on HOST over SSH so the bridge and "
+            "Hermes secrets stay on the Hermes host; remote HTTP MCP is not implemented"
+        ),
+    )
+    parser.add_argument(
+        "--name", default=None,
+        help=f"client-config only: MCP server name in the generated config (default: {DEFAULT_SERVER_NAME})",
     )
     parser.add_argument("--api-url", default=DEFAULT_API_URL, help="Hermes API Server base URL (non-secret)")
     parser.add_argument("--api-key-env", default=DEFAULT_API_KEY_ENV, help="Environment variable containing API key")
@@ -95,8 +122,51 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_client_config(args: argparse.Namespace) -> int:
+    """Generate one client config payload on stdout; guidance/warnings on stderr."""
+    warnings: list[str] = []
+    discovery = None
+    try:
+        name = client_config.validate_server_name(args.name or DEFAULT_SERVER_NAME)
+        if args.ssh is not None:
+            discovery = client_config.discover_ssh(args.ssh)
+            plan = client_config.build_ssh_plan(args.client, name, discovery)
+        else:
+            plan = client_config.build_local_plan(args.client, name, warn=warnings.append)
+        payload = client_config.render_plan(plan, args.client)
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        print(f"client-config: {exc}", file=sys.stderr)
+        return 2
+
+    sys.stdout.write(payload)
+    for message in warnings:
+        print(f"warning: {message}", file=sys.stderr)
+    print(
+        f"Generated non-mutating {args.client} configuration for MCP server {name!r}; no files were written.",
+        file=sys.stderr,
+    )
+    destination = CLIENT_CONFIG_DESTINATIONS.get(args.client)
+    if destination:
+        print(f"Usual destination: {destination}", file=sys.stderr)
+    if discovery is not None:
+        hint = f"ssh {shlex.quote(discovery.host)} {shlex.quote(discovery.remote_command + ' doctor')}"
+        print(f"Recommended readiness check before connecting: {hint}", file=sys.stderr)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command == "client-config":
+        if args.client is None:
+            parser.error(
+                "client-config requires a target client: one of " + ", ".join(SUPPORTED_CLIENTS)
+            )
+        return _run_client_config(args)
+    if args.client is not None:
+        parser.error(f"unrecognized arguments: {args.client}")
+    if args.ssh is not None or args.name is not None:
+        parser.error("--ssh/--name are only valid with the client-config command")
     logging.basicConfig(level=getattr(logging, args.log_level), stream=sys.stderr)
     registry: StateRegistry | None = None
     service: BridgeService | None = None

@@ -28,10 +28,21 @@ def default_profiles_root() -> Path:
     return hermes_home() / "profiles"
 
 
+def state_home() -> Path:
+    """XDG state base directory used for bridge-owned registry files."""
+    configured = os.environ.get("XDG_STATE_HOME")
+    base = Path(configured).expanduser() if configured else Path.home() / ".local" / "state"
+    if not base.is_absolute():
+        # Client-config generation embeds absolute paths; a relative
+        # XDG_STATE_HOME would leak the generator's cwd into those configs, so
+        # fall back to the XDG default instead.
+        base = Path.home() / ".local" / "state"
+    return base
+
+
 def default_state_db() -> Path:
-    state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")).expanduser()
-    preferred = state_home / "hermes-control-mcp" / "bridge.db"
-    legacy = state_home / "hermes-zcode-bridge" / "bridge.db"
+    preferred = state_home() / "hermes-control-mcp" / "bridge.db"
+    legacy = state_home() / "hermes-zcode-bridge" / "bridge.db"
     # Reuse the historical private-deployment path only when the new public
     # path does not exist, avoiding an accidental empty registry after rename.
     if not preferred.exists() and legacy.exists():

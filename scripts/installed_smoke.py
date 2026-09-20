@@ -8,6 +8,7 @@ import selectors
 import subprocess
 import tempfile
 import threading
+import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -73,10 +74,46 @@ def terminate(process: subprocess.Popen[str]) -> None:
             stream.close()
 
 
+def check_client_config_generation(entrypoint: str, env: dict[str, str]) -> None:
+    """UX1: the installed wheel must generate parseable, secret-free configs."""
+    # Put the installed entrypoint directory on PATH so generation exercises
+    # its executable discovery and emits the installed bridge command.
+    env = dict(env)
+    env["PATH"] = f"{Path(entrypoint).parent}{os.pathsep}{env.get('PATH', os.defpath)}"
+    expected: dict[str, object] = {}
+    for client, parser_name in (("zcode", "json"), ("codex", "toml")):
+        generated = subprocess.run(
+            [entrypoint, "client-config", client],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        assert generated.returncode == 0, generated.stderr or generated.stdout
+        assert generated.stdout.strip(), "client-config produced empty stdout"
+        if parser_name == "json":
+            payload = json.loads(generated.stdout)
+            entry = payload["mcp"]["servers"]["hermes"]
+        else:
+            payload = tomllib.loads(generated.stdout)
+            entry = payload["mcp_servers"]["hermes"]
+        assert entry["command"] == entrypoint, (entry["command"], entrypoint)
+        args = entry["args"]
+        assert args[0] == "--state-db"
+        db_path = Path(args[1])
+        assert db_path.is_absolute(), db_path
+        assert not db_path.exists(), "client-config must not create the state DB"
+        assert "installed-smoke-secret" not in generated.stdout
+        assert "installed-smoke-secret" not in generated.stderr
+        expected[client] = payload
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--entrypoint", required=True)
     args = parser.parse_args()
+    entrypoint = str(Path(args.entrypoint).resolve())
 
     api = ThreadingHTTPServer(("127.0.0.1", 0), FakeAPIHandler)
     thread = threading.Thread(target=api.serve_forever, daemon=True)
@@ -88,7 +125,7 @@ def main() -> int:
             env["INSTALLED_SMOKE_API_KEY"] = "installed-smoke-secret"
             doctor = subprocess.run(
                 [
-                    args.entrypoint,
+                    entrypoint,
                     "doctor",
                     "--json",
                     "--api-url",
@@ -112,9 +149,11 @@ def main() -> int:
             assert "installed-smoke-secret" not in doctor.stdout
             assert "installed-smoke-secret" not in doctor.stderr
 
+            check_client_config_generation(entrypoint, env)
+
             process = subprocess.Popen(
                 [
-                    args.entrypoint,
+                    entrypoint,
                     "--api-url",
                     f"http://127.0.0.1:{api.server_port}",
                     "--api-key-env",
