@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from hermes_control_mcp.config import BridgeConfig
 from hermes_control_mcp.doctor import discover_named_profiles, format_doctor_report, run_doctor
@@ -98,6 +100,26 @@ class DoctorTests(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertEqual(report["status"], "not_ready")
         self.assertTrue(report["live"]["required"])
+
+    def test_missing_default_api_key_returns_structured_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_key_env = "HERMES_CONTROL_MCP_TEST_MISSING_KEY"
+            config = BridgeConfig(
+                api_url="http://bridge.test:8642",
+                api_key=None,
+                api_key_env=missing_key_env,
+                env_file=Path(tmp) / "missing.env",
+                state_db=Path(tmp) / "state.db",
+                profiles_root=Path(tmp) / "profiles",
+                request_timeout=1,
+            )
+            with patch.dict(os.environ, {missing_key_env: ""}):
+                report = run_doctor(config)
+
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["status"], "not_ready")
+        self.assertEqual(report["core"]["error_code"], "doctor_check_failed")
+        self.assertIn("Missing API key", report["core"]["error"])
 
     def test_configured_live_probe_can_be_required(self):
         with tempfile.TemporaryDirectory() as tmp:

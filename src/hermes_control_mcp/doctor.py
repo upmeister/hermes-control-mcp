@@ -30,15 +30,21 @@ def discover_named_profiles(profiles_root: Path) -> list[str]:
 
 
 def _redact_config_secrets(config: BridgeConfig, text: str) -> str:
-    values = (
-        config.resolved_api_key(),
-        config.resolved_gateway_token(),
-        config.resolved_gateway_access_token(),
-        config.resolved_gateway_refresh_token(),
-        config.resolved_gateway_ticket(),
-    )
     redacted = str(text)
-    for value in values:
+    resolvers = (
+        config.resolved_api_key,
+        config.resolved_gateway_token,
+        config.resolved_gateway_access_token,
+        config.resolved_gateway_refresh_token,
+        config.resolved_gateway_ticket,
+    )
+    for resolve in resolvers:
+        try:
+            value = resolve()
+        except (ConfigError, OSError):
+            # Redaction must not turn an already-safe configuration error into
+            # a second exception (for example when the API key is missing).
+            continue
         if value:
             redacted = redacted.replace(value, "[REDACTED]")
     return redacted
