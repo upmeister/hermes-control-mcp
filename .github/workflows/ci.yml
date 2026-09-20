@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@v4
@@ -45,16 +45,20 @@ jobs:
         run: git diff --check
 
   package:
-    name: build + clean installed-artifact smoke
+    name: build + clean installed-artifact smoke / Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
     needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
           cache: pip
 
       - name: Build wheel and sdist
@@ -66,12 +70,12 @@ jobs:
 
       - name: Install wheel in a fresh venv
         run: |
-          python -m venv /tmp/hermes-control-mcp-smoke
-          /tmp/hermes-control-mcp-smoke/bin/python -m pip install --upgrade pip
-          /tmp/hermes-control-mcp-smoke/bin/python -m pip install dist/*.whl
-          /tmp/hermes-control-mcp-smoke/bin/hermes-control-mcp --help
+          python -m venv /tmp/hermes-control-mcp-smoke-${{ matrix.python-version }}
+          /tmp/hermes-control-mcp-smoke-${{ matrix.python-version }}/bin/python -m pip install --upgrade pip
+          /tmp/hermes-control-mcp-smoke-${{ matrix.python-version }}/bin/python -m pip install dist/*.whl
+          /tmp/hermes-control-mcp-smoke-${{ matrix.python-version }}/bin/hermes-control-mcp --help
 
       - name: Installed MCP stdio smoke
         run: |
           python scripts/installed_smoke.py \
-            --entrypoint /tmp/hermes-control-mcp-smoke/bin/hermes-control-mcp
+            --entrypoint /tmp/hermes-control-mcp-smoke-${{ matrix.python-version }}/bin/hermes-control-mcp
