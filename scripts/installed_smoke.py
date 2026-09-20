@@ -86,6 +86,32 @@ def main() -> int:
         with tempfile.TemporaryDirectory() as tmp:
             env = os.environ.copy()
             env["INSTALLED_SMOKE_API_KEY"] = "installed-smoke-secret"
+            doctor = subprocess.run(
+                [
+                    args.entrypoint,
+                    "doctor",
+                    "--json",
+                    "--api-url",
+                    f"http://127.0.0.1:{api.server_port}",
+                    "--api-key-env",
+                    "INSTALLED_SMOKE_API_KEY",
+                    "--state-db",
+                    str(Path(tmp) / "doctor.db"),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            assert doctor.returncode == 0, doctor.stderr or doctor.stdout
+            doctor_payload = json.loads(doctor.stdout)
+            assert doctor_payload["ok"] is True
+            assert doctor_payload["capability_tiers"]["durable"] == "stable"
+            assert doctor_payload["capability_tiers"]["live"] == "experimental_unavailable"
+            assert "installed-smoke-secret" not in doctor.stdout
+            assert "installed-smoke-secret" not in doctor.stderr
+
             process = subprocess.Popen(
                 [
                     args.entrypoint,
