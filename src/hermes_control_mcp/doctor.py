@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .api import APIError, HermesAPIClient
-from .config import BridgeConfig, ConfigError
+from .config import BridgeConfig, ConfigError, DEFAULT_API_URL, hermes_home, read_env_value
 from .live_client import LiveError, LiveGatewayClient
 from .profiles import DEFAULT_PROFILE, PROFILE_ID_RE, canonical_profile, named_profile_api_key
 
@@ -27,6 +28,87 @@ def discover_named_profiles(profiles_root: Path) -> list[str]:
         if PROFILE_ID_RE.fullmatch(name):
             names.append(name)
     return sorted(set(names))
+
+
+def _api_key_status(config: BridgeConfig) -> dict[str, Any]:
+    """Describe default API-key resolution without returning the credential."""
+    if config.api_key:
+        return {"present": True, "source": "explicit configuration"}
+
+    env_name = config.api_key_env
+    if env_name and os.environ.get(env_name):
+        return {"present": True, "source": f"environment:{env_name}"}
+
+    dotenv = config.env_file or (hermes_home() / ".env")
+    if env_name:
+        try:
+            value = read_env_value(dotenv, env_name)
+        except ConfigError:
+            return {
+                "present": False,
+                "source": f"file:{dotenv}",
+                "status": "invalid",
+            }
+        if value:
+            return {"present": True, "source": f"file:{dotenv}"}
+
+    return {"present": False, "source": f"file:{dotenv}"}
+
+
+def _doctor_hints(
+    config: BridgeConfig,
+    *,
+    core: dict[str, Any],
+    profiles: dict[str, Any],
+    live: dict[str, Any],
+) -> list[str]:
+    """Return actionable, secret-free next steps for common readiness failures."""
+    hints: list[str] = []
+    code = str(core.get("error_code") or "")
+    http_status = core.get("http_status")
+
+    if code == "api_key_missing":
+        source = _api_key_status(config).get("source")
+        hints.append(
+            f"Provide {config.api_key_env} to the bridge process or place it in {source.removeprefix('file:') if isinstance(source, str) and source.startswith('file:') else 'the configured env file'}."
+        )
+
+    if code == "transport_unknown":
+        hints.append(
+            f"Verify the configured Hermes API from the bridge host: curl {config.api_url}/health"
+        )
+        if config.api_url == DEFAULT_API_URL:
+            hints.append(
+                "127.0.0.1 refers to the machine running hermes-control-mcp. "
+                "If Hermes runs on another host, pass --api-url http://<hermes-host>:8642."
+            )
+        else:
+            hints.append(
+                "For a remote Hermes host, verify API_SERVER_HOST/bind settings and the firewall, VPN, or tunnel path to port 8642."
+            )
+
+    if http_status == 401 or code in {"unauthorized", "invalid_api_key", "authentication_failed"}:
+        hints.append(
+            "The API endpoint is reachable but authentication failed. Verify that the bridge's resolved API_SERVER_KEY matches the target Hermes profile."
+        )
+
+    missing_profiles = [
+        name for name, item in profiles.items()
+        if item.get("error_code") == "profile_key_unavailable"
+    ]
+    if missing_profiles:
+        hints.append(
+            "Named-profile credentials are resolved on the bridge host under "
+            f"{config.resolved_profiles_root()}/<profile>/.env. "
+            "For a remote MCP client, prefer launching the bridge on the Hermes host (for example over SSH) instead of copying profile secrets."
+        )
+
+    if live.get("error_code") not in {None, "live_not_configured"} and not live.get("ok"):
+        hints.append(
+            "Live owner attach is local-only: the bridge must run on the same Linux host and Unix user as the compatible Hermes owner runtime."
+        )
+
+    return hints
 
 
 def _redact_config_secrets(config: BridgeConfig, text: str) -> str:
@@ -51,8 +133,11 @@ def _redact_config_secrets(config: BridgeConfig, text: str) -> str:
 
 
 def _safe_error(exc: Exception, *, config: BridgeConfig | None = None) -> tuple[str, str]:
-    code = str(getattr(exc, "code", "") or "doctor_check_failed")
     message = str(exc)
+    if isinstance(exc, ConfigError):
+        code = "api_key_missing" if message.startswith("Missing API key") else "config_error"
+    else:
+        code = str(getattr(exc, "code", "") or "doctor_check_failed")
     if config is not None:
         message = _redact_config_secrets(config, message)
     return code, message
@@ -65,12 +150,16 @@ def _api_probe(client: HermesAPIClient, profile: str) -> dict[str, Any]:
         models = client.models(profile=profile)
     except (APIError, ConfigError, ValueError) as exc:
         code, message = _safe_error(exc, config=client.config)
-        return {
+        report = {
             "ok": False,
             "status": "failed",
             "error_code": code,
             "error": message,
         }
+        http_status = int(getattr(exc, "status", 0) or 0)
+        if http_status:
+            report["http_status"] = http_status
+        return report
 
     data = models.get("data") if isinstance(models, dict) else None
     model_count = len(data) if isinstance(data, list) else None
@@ -216,9 +305,24 @@ def run_doctor(
     if all_profiles and not requested:
         warnings.append("No named profile directories were discovered.")
 
+    effective_config = {
+        "api_url": config.api_url,
+        "api_key": _api_key_status(config),
+        "profiles_root": str(config.resolved_profiles_root()),
+        "state_db": str(config.state_db),
+        "env_file": str(config.env_file) if config.env_file is not None else None,
+    }
+    next_steps = _doctor_hints(
+        config,
+        core=core,
+        profiles=profile_reports,
+        live=live,
+    )
+
     return {
         "ok": overall_ok,
         "status": "ready" if overall_ok else "not_ready",
+        "config": effective_config,
         "capability_tiers": {
             "durable": "stable" if core_ok else "unavailable",
             "live": "experimental_ready" if live.get("ok") else "experimental_unavailable",
@@ -227,14 +331,26 @@ def run_doctor(
         "profiles": profile_reports,
         "live": live,
         "warnings": warnings,
+        "next_steps": next_steps,
     }
 
 
 def format_doctor_report(report: dict[str, Any]) -> str:
     """Human-readable report that never includes credential values."""
+    config = report.get("config") or {}
+    key_info = config.get("api_key") or {}
+    key_state = "PRESENT" if key_info.get("present") else "MISSING"
+    key_source = key_info.get("source") or "unknown"
+
     lines = [
         "Hermes MCP bridge doctor",
         f"overall: {'READY' if report.get('ok') else 'NOT READY'}",
+        "",
+        "Effective configuration",
+        f"  API URL ............ {config.get('api_url') or 'unknown'}",
+        f"  API key ............ {key_state} ({key_source})",
+        f"  profiles root ...... {config.get('profiles_root') or 'unknown'}",
+        f"  state DB ........... {config.get('state_db') or 'unknown'}",
         "",
         "Durable core",
     ]
@@ -243,6 +359,8 @@ def format_doctor_report(report: dict[str, Any]) -> str:
         f"  default API ........ {'PASS' if core.get('ok') else 'FAIL'}"
         + (f" ({core.get('error_code')})" if core.get("error_code") else "")
     )
+    if not core.get("ok") and core.get("error"):
+        lines.append(f"  detail ............. {core.get('error')}")
     if core.get("version"):
         lines.append(f"  Hermes version ..... {core.get('version')}")
     if core.get("model_count") is not None:
@@ -256,6 +374,8 @@ def format_doctor_report(report: dict[str, Any]) -> str:
             state = "PASS" if item.get("ok") else "FAIL"
             suffix = f" ({item.get('error_code')})" if item.get("error_code") else ""
             lines.append(f"  {name:<20} {state}{suffix}")
+            if not item.get("ok") and item.get("error"):
+                lines.append(f"    -> {item.get('error')}")
 
     live = report.get("live") or {}
     lines.extend(["", "Live shared-session tier"])
@@ -264,6 +384,17 @@ def format_doctor_report(report: dict[str, Any]) -> str:
         live_state = "FAIL (required)"
     suffix = f" ({live.get('error_code')})" if live.get("error_code") else ""
     lines.append(f"  owner/native attach  {live_state}{suffix}")
+    if (
+        not live.get("ok")
+        and live.get("error")
+        and live.get("error_code") != "live_not_configured"
+    ):
+        lines.append(f"  detail ............. {live.get('error')}")
+
+    next_steps = report.get("next_steps") or []
+    if next_steps:
+        lines.extend(["", "Next steps"])
+        lines.extend(f"  - {step}" for step in next_steps)
 
     warnings = report.get("warnings") or []
     if warnings:
