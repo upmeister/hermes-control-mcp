@@ -720,6 +720,11 @@ class LiveProfileTests(unittest.TestCase):
 
     def test_reconnect_replay_carries_the_stored_profile(self):
         service, _, gateway = self.make_service()
+        # This test is about replay profile propagation, not completion races.
+        # Disable the fake delayed completion so reconnect cannot overlap an
+        # unrelated message.complete timer and turn a profile assertion into a
+        # timing-dependent replay-degradation failure.
+        gateway.complete_delay = None
         self.assertTrue(service.open(lane="repo", profile="coder")["ok"])
         prompted = service.prompt(lane="repo", text="replay me", wait_seconds=0)
         self.assertTrue(prompted["ok"])
