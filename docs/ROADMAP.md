@@ -97,6 +97,8 @@ snippets drifting across clients.
 This is deliberately a small UX layer over the existing trust model, not a new
 remote transport.
 
+See [UX1 implementation brief](UX1-IMPLEMENTATION-BRIEF.md).
+
 ## Next substantive priority: R1 — Agent Sessions API parity research
 
 Compare Hermes:
