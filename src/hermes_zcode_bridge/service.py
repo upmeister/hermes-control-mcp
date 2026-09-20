@@ -149,6 +149,53 @@ class BridgeService:
             error_code=code, error=str(exc)
         )
 
+    def _start_profile(
+        self,
+        *,
+        lane: str,
+        supplied_profile: str | None,
+        session_id: str | None,
+        existing_request: dict[str, Any] | None,
+        existing_idempotency: dict[str, Any] | None,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Resolve profile for a durable admission without turning omission into default too early.
+
+        Exact local identity wins when profile is omitted: request_id first,
+        then explicit Idempotency-Key, then a known supplied session. Otherwise
+        one existing lane profile may be inferred. Only a genuinely new,
+        unbound admission defaults to the default profile.
+        """
+        if supplied_profile is not None:
+            return supplied_profile, None
+        if existing_request is not None:
+            return str(existing_request.get("profile") or DEFAULT_PROFILE), None
+        if existing_idempotency is not None:
+            return str(existing_idempotency.get("profile") or DEFAULT_PROFILE), None
+        if session_id:
+            session_profiles = sorted(
+                set(self.registry.profiles_for_session(session_id))
+                | set(self.registry.profiles_for_request_session(session_id))
+            )
+            if len(session_profiles) > 1:
+                return DEFAULT_PROFILE, self._result(
+                    status="failed", error_code="lane_profile_ambiguous",
+                    error=(f"Session {session_id!r} is locally known under multiple profiles "
+                           f"{session_profiles}; supply an explicit profile"),
+                )
+            if len(session_profiles) == 1:
+                return session_profiles[0], None
+        lane_profiles = sorted(
+            set(self.registry.profiles_for_lane(lane))
+            | set(self.registry.request_profiles_for_lane(lane))
+        )
+        if len(lane_profiles) > 1:
+            return DEFAULT_PROFILE, self._result(
+                status="failed", error_code="lane_profile_ambiguous",
+                error=(f"Lane {lane!r} exists under multiple profiles {lane_profiles}; "
+                       "supply an explicit profile"),
+            )
+        return (lane_profiles[0] if lane_profiles else DEFAULT_PROFILE), None
+
     def _lane_session(
         self, profile: str, lane: str, supplied: str | None
     ) -> tuple[str | None, dict[str, Any] | None]:
@@ -210,17 +257,29 @@ class BridgeService:
                 instructions = _validate_text(
                     instructions, "instructions", max_length=100_000, allow_common_whitespace=True
                 )
-            profile = _profile_input(profile)
+            supplied_profile = _optional_profile(profile)
             request_id = _visible_id(request_id, "request_id", max_length=128) if request_id else f"req_{uuid.uuid4().hex}"
-            selected_session, lane_error = self._lane_session(profile, lane, session_id)
-            if lane_error is not None:
-                lane_error["request_id"] = request_id
-                return lane_error
             idempotency_key = (
                 _visible_id(idempotency_key, "idempotency_key") if idempotency_key else f"bridge:{request_id}"
             )
             if len(idempotency_key) > 255:
                 raise InputError("idempotency_key is too long")
+            existing = self.registry.request_by_id(request_id)
+            by_key = self.registry.request_by_idempotency(idempotency_key)
+            profile, profile_error = self._start_profile(
+                lane=lane,
+                supplied_profile=supplied_profile,
+                session_id=session_id,
+                existing_request=existing,
+                existing_idempotency=by_key,
+            )
+            if profile_error is not None:
+                profile_error["request_id"] = request_id
+                return profile_error
+            selected_session, lane_error = self._lane_session(profile, lane, session_id)
+            if lane_error is not None:
+                lane_error["request_id"] = request_id
+                return lane_error
             body_for_fingerprint: dict[str, Any] = {"input": prompt}
             for key, value in (
                 ("session_id", session_id), ("model", model), ("provider", provider), ("instructions", instructions)
@@ -231,7 +290,6 @@ class BridgeService:
         except InputError as exc:
             return self._input_error(exc, request_id=request_id)
 
-        existing = self.registry.request_by_id(request_id)
         if existing is not None:
             if str(existing.get("profile") or DEFAULT_PROFILE) != profile:
                 return self._result(
@@ -252,14 +310,13 @@ class BridgeService:
                 return self._existing_result(existing)
             if existing.get("status") == "unknown" and existing.get("run_id"):
                 try:
-                    reconciled = self.status(str(existing["run_id"]))
+                    reconciled = self.status(run_id=str(existing["run_id"]), profile=profile)
                     if reconciled.get("error_code") is None:
                         return reconciled
                 except Exception:
                     pass
             idempotency_key = str(existing["idempotency_key"])
         else:
-            by_key = self.registry.request_by_idempotency(idempotency_key)
             if by_key is not None and by_key.get("request_id") != request_id:
                 if by_key.get("fingerprint") == fingerprint:
                     return self._existing_result(by_key)

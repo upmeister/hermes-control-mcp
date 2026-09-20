@@ -14,8 +14,10 @@ except ImportError:  # pragma: no cover - exercised by the startup error path
 _TOOL_DESCRIPTIONS = {
     "run_start": (
         "Start one idempotent Hermes durable run in a named lane. Optional profile routes the run "
-        "through that profile's /p/<profile>/ API and credentials; omitted means the default profile. "
-        "A request_id already used under a different profile conflicts instead of rerouting."
+        "through that profile's /p/<profile>/ API and credentials. When omitted, an exact existing "
+        "request/idempotency/session identity or one unambiguous existing lane profile is inferred; "
+        "only a genuinely new unbound admission defaults to the default profile. An explicitly "
+        "supplied conflicting profile fails closed instead of rerouting."
     ),
     "run_status": (
         "Read status and terminal output for one exact Hermes run. Optional profile must match the "
@@ -35,9 +37,10 @@ _TOOL_DESCRIPTIONS = {
     "live_session_open": (
         "Connect to the existing Hermes TUI WebSocket and create or resume one durable session lane "
         "under a profile. Optional profile: supplied names the (profile, lane) binding exactly; "
-        "omitted infers the lane's single bound profile and fails with lane_profile_ambiguous when "
-        "several profiles share the lane name; an unbound lane uses the default profile. Here "
-        "session_id is the stored/durable ID to resume; the response session_id is the runtime ID "
+        "omitted infers an exact known stored session's profile first, otherwise the lane's single "
+        "bound profile; ambiguous known identities fail with lane_profile_ambiguous, and a genuinely "
+        "unbound new lane uses the default profile. Here session_id is the stored/durable ID to resume; "
+        "the response session_id is the runtime ID "
         "and stored_session_id is the durable ID. Prefer lane for subsequent reads and control calls."
     ),
     "live_prompt": (
@@ -100,8 +103,9 @@ def create_server(service: BridgeService):
         "hermes-zcode-bridge",
         instructions=(
             "Thin Hermes Agent durable-runs and live-TUI bridge. Use exact lane/session/run/request identities. "
-            "Profile routing: an omitted profile uses the default profile, infers a lane's or session's single "
-            "bound profile, and fails closed (lane_profile_ambiguous / conflict errors) instead of guessing; "
+            "Profile routing: an omitted profile first infers an exact locally known request/session or a lane's "
+            "single bound profile; only a genuinely new unbound identity uses default. Ambiguous/conflicting "
+            "identities fail closed (lane_profile_ambiguous / conflict errors) instead of guessing; "
             "named profiles route through /p/<profile>/ with their own credentials and never inherit the "
             "default key. "
             "For live_session_open, its session_id argument is a stored/durable ID; the response session_id "

@@ -37,6 +37,16 @@ All notable user-facing changes to this local bridge are documented here.
 
 ### Fixed
 
+- Stage 2.2B.1 admission inference: omitting `profile` no longer silently
+  routes a new durable run to `default` when an exact existing
+  request/idempotency/session identity or one unambiguous lane already belongs
+  to a named profile. Exact request identity outranks later lane ambiguity;
+  genuinely shared lanes fail closed. `live_session_open` likewise infers a
+  known stored session's profile on a new lane, and duplicate `live_prompt`
+  request IDs retain their stored profile when the caller omits it. An
+  explicitly supplied conflicting profile still fails closed. The durable
+  unknown-run reconciliation call now also preserves the resolved profile.
+
 - Lifecycle recovery (Stage 2.2A): a conservative `live_wait` result that
   hands a request to durable recovery (`completion_not_observed`, and
   `ambiguous_turn` when ownership cannot be proven and reconciliation is
