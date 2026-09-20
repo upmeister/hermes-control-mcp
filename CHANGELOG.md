@@ -4,6 +4,23 @@ All notable public changes to Hermes MCP Control Plane are documented here.
 
 ## [Unreleased]
 
+## [0.2.0b2] - 2026-09-20
+
+Compatibility/install patch.
+
+### Added
+
+- Python 3.14 support and CI coverage.
+- Clean installed-wheel smoke coverage on both Python 3.11 and 3.14.
+- PEP 668-friendly installation guidance using `uv tool`, `pipx`, or a virtual environment.
+
+### Fixed
+
+- Removed a timing race from the reconnect/profile replay regression test by
+  disabling an unrelated delayed fake completion. The same Python 3.12 job
+  passed unchanged on rerun, confirming the failure was a test flake rather
+  than an interpreter compatibility issue.
+
 ## [0.2.0b1] - 2026-09-20
 
 First public beta.
