@@ -106,7 +106,7 @@ Hermes profile identity is a first-class routing and security boundary. The publ
 (profile, lane) -> stored_session_id
 ~~~
 
-- An omitted `profile` uses the default profile; an existing lane/session/run/request identity may supply the profile by inference when exactly one profile is bound, and lane-only lookups fail closed with `lane_profile_ambiguous` when several profiles share the lane name. A supplied profile that disagrees with a stored identity is a conflict, never a reroute.
+- An omitted `profile` first inherits an exact locally known request/idempotency/session identity or one unambiguous existing lane profile. Only a genuinely new, unbound admission defaults to `default`. Lane-only ambiguity fails closed with `lane_profile_ambiguous`; an explicitly supplied profile that disagrees with stored identity is a conflict, never a reroute.
 - The same lane name may legally exist in two profiles; live runtime routing keys on `(profile, lane)`.
 - Live create/resume/activate, prompt submission, status/history/events, steer and interrupt carry the resolved profile; it survives restart, reconnect and reconcile (reconcile uses the request's stored profile). The transient `4007` resume retry repeats the identical profile-scoped params.
 - Durable API calls for a named profile route through Hermes `/p/<profile>/...` and resolve that profile's own `API_SERVER_KEY` from `<profiles_root>/<profile>/.env` (`--profiles-root`, default `$HERMES_HOME/profiles`). A missing named-profile key fails closed; the default profile key is never inherited for named profiles.
