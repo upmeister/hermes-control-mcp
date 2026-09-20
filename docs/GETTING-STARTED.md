@@ -32,6 +32,15 @@ For the stable durable tier, the bridge needs:
 
 Shared live attach is optional and has additional same-host requirements.
 
+If everything runs on one machine under one user, start with that path first.
+It is intentionally the simplest deployment: the default API URL, default key,
+and named-profile key tree can all be discovered locally.
+
+Client configuration files are a separate concern. MCP defines the wire
+protocol, not one universal host-config schema. See
+[MCP client configuration](MCP-CLIENTS.md) for ZCode, Claude Code, Cursor,
+Codex, and VS Code examples.
+
 ## What is `API_SERVER_KEY`?
 
 `API_SERVER_KEY` is the bearer credential that protects Hermes' API Server. It
@@ -214,21 +223,12 @@ hermes-control-mcp doctor
 Because the bridge runs under the same user, it can read `~/.hermes/.env` and
 the default URL `http://127.0.0.1:8642` normally needs no override.
 
-A minimal MCP-host configuration is therefore genuinely enough:
+At this point the bridge itself needs no additional routing flags. Configure
+your MCP host to launch `hermes-control-mcp` over stdio.
 
-~~~json
-{
-  "mcpServers": {
-    "hermes": {
-      "command": "hermes-control-mcp"
-    }
-  }
-}
-~~~
-
-Some MCP hosts require an explicit `"type": "stdio"`; others infer stdio from
-`command`. That field belongs to the MCP host's configuration format, not to
-Hermes MCP Control Plane.
+Do not treat one JSON snippet as universal client syntax. ZCode, Claude Code,
+Cursor, Codex, and VS Code use related but different configuration surfaces;
+the exact forms are collected in [MCP client configuration](MCP-CLIENTS.md).
 
 ### Topology B — bridge on another VM/host over the LAN or VPN
 
@@ -368,14 +368,19 @@ uses `/proc/<pid>/stat` and Unix-domain socket ownership checks.
 
 ## Reading `doctor` output
 
-Run:
+The normal human-readable report now includes the effective API URL, whether a
+default API key was found and where it was resolved from, the profiles root,
+the state DB, failure detail, and actionable next steps. Credential **values**
+are never printed.
+
+Use:
 
 ~~~bash
 hermes-control-mcp doctor --json
 ~~~
 
-when you need the detailed error text; the human view intentionally stays
-compact.
+when you want the same readiness data as structured JSON for automation or bug
+reports.
 
 Common results:
 
