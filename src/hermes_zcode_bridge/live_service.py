@@ -411,6 +411,14 @@ class LiveService:
             existing_request = self.registry.live_request_by_id(request_id)
             if existing_request is not None:
                 record_profile = str(existing_request.get("profile") or DEFAULT_PROFILE)
+                if str(existing_request.get("lane") or "") != lane:
+                    return self._result(
+                        status="failed", request_id=request_id,
+                        session_id=existing_request.get("runtime_session_id"),
+                        stored_session_id=existing_request.get("session_id"),
+                        profile=record_profile, error_code="request_id_conflict",
+                        error="request_id was already used for a different live lane",
+                    )
                 if supplied_profile is not None and supplied_profile != record_profile:
                     return self._result(
                         status="failed", request_id=request_id,
