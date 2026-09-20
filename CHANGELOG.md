@@ -4,6 +4,37 @@ All notable user-facing changes to this local bridge are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- First-class multi-profile routing (Stage 2.2B): Hermes profile identity is
+  now a first-class bridge routing and security boundary. Lane bindings are
+  profile-aware (`(profile, lane) -> stored_session_id`), the same lane name
+  may legally exist in two profiles, and lane-only lookups infer the single
+  bound profile or fail closed with `lane_profile_ambiguous`. Named-profile
+  live sessions carry `profile` on create/resume/activate, prompt submission,
+  status/history/events, steer and interrupt, across restart, reconnect and
+  reconcile (reconcile uses the request's stored profile; it accepts no
+  profile argument). The transient `4007` resume retry repeats the identical
+  profile-scoped params. Durable API calls for a named profile route through
+  Hermes `/p/<profile>/...` and resolve that profile's own `API_SERVER_KEY`
+  from `<profiles_root>/<profile>/.env` (`--profiles-root`, default
+  `$HERMES_HOME/profiles`); a missing named key fails closed and the default
+  key is never inherited. Existing databases migrate additively: legacy rows
+  read as the `default` profile, legacy lanes become `default` bindings, and
+  default-profile lane dual-writes keep the legacy table as a rollback path.
+  MCP tools accept an optional `profile` argument with omission/inference/
+  ambiguity semantics documented in their descriptions; results include the
+  canonical `profile` where it identifies the target. New structured errors:
+  `invalid_profile`, `lane_profile_ambiguous`, `lane_profile_conflict`,
+  `request_profile_conflict`, `profile_key_unavailable`,
+  `profile_route_config_error`. Reconnect replay (`session.events.since`)
+  addresses each buffered session under its remembered profile. API error
+  redaction covers every key the client knows (the default key and any
+  resolved named-profile key), not only the key used by the current request.
+  A runtime-addressed live call whose supplied profile disagrees with the
+  stored binding fails closed with `request_profile_conflict` instead of
+  routing through the wrong profile.
+
 ### Fixed
 
 - Lifecycle recovery (Stage 2.2A): a conservative `live_wait` result that

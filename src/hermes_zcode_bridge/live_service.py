@@ -7,8 +7,9 @@ import uuid
 from typing import Any
 
 from .live_client import LiveAuthError, LiveError, LiveGatewayClient, LiveRPCError, LiveTransportUnknown
+from .profiles import DEFAULT_PROFILE
 from .registry import StateRegistry
-from .service import InputError, _fingerprint, _validate_text, _visible_id
+from .service import InputError, _fingerprint, _profile_input, _validate_text, _visible_id
 
 
 class LiveService:
@@ -18,9 +19,11 @@ class LiveService:
         self.client = client
         self.registry = registry
         self._lock = threading.RLock()
-        # runtime ids are process-local; the durable lane table is the source
-        # used to resume them after this MCP process is restarted.
-        self._runtimes: dict[str, str] = {}
+        # runtime ids are process-local and keyed by (profile, lane): the same
+        # lane name may legally exist in two profiles, so a lane-only key would
+        # route nondeterministically. The durable (profile, lane) binding is
+        # the source used to resume after this MCP process is restarted.
+        self._runtimes: dict[tuple[str, str], str] = {}
         self._stored_by_runtime: dict[str, str] = {}
 
     @staticmethod
@@ -52,7 +55,10 @@ class LiveService:
 
     @staticmethod
     def _input_error(exc: Exception, *, request_id: str | None = None) -> dict[str, Any]:
-        return LiveService._result(status="failed", request_id=request_id, error_code="invalid_input", error=str(exc))
+        return LiveService._result(
+            status="failed", request_id=request_id, error_code=getattr(exc, "code", "invalid_input"),
+            error=str(exc)
+        )
 
     def _error(self, exc: Exception, *, request_id: str | None = None, session_id: str | None = None) -> dict[str, Any]:
         # Safe snapshot only: health intentionally omits endpoint and all
@@ -104,7 +110,7 @@ class LiveService:
 
     # ----- shared-turn ownership evidence ---------------------------------
 
-    def _running_turn_snapshot(self, runtime: str) -> dict[str, Any] | None:
+    def _running_turn_snapshot(self, runtime: str, profile: str = DEFAULT_PROFILE) -> dict[str, Any] | None:
         """Read the gateway's live turn state via ``session.activate``.
 
         Source contract (deployed Hermes 90f1126b): the activate payload carries
@@ -117,7 +123,7 @@ class LiveService:
         try:
             reply = self.client.request(
                 "session.activate",
-                {"session_id": runtime, "omit_messages": True},
+                {"session_id": runtime, "omit_messages": True, "profile": profile},
                 timeout=min(10.0, self.client.config.gateway_request_timeout),
             )
         except LiveError:
@@ -141,7 +147,7 @@ class LiveService:
             return False
         return hashlib.sha256(user.encode("utf-8")).hexdigest() == inflight_sha256
 
-    def _prove_running_claim(self, runtime: str, inflight_sha256: str) -> tuple[int, str, int] | None:
+    def _prove_running_claim(self, runtime: str, inflight_sha256: str, profile: str = DEFAULT_PROFILE) -> tuple[int, str, int] | None:
         """Prove the currently running turn was claimed by our own submit.
 
         The submit ack was ``streaming``, so the gateway claimed our turn. The
@@ -150,7 +156,7 @@ class LiveService:
         epoch, and connection generation so later completions can be ordered
         after the proof and invalidated by any reconnect.
         """
-        snapshot = self._running_turn_snapshot(runtime)
+        snapshot = self._running_turn_snapshot(runtime, profile)
         if snapshot is None or not snapshot["running"] or not self._inflight_matches(snapshot, inflight_sha256):
             return None
         health = self.client.health()
@@ -159,7 +165,7 @@ class LiveService:
             return None
         return self.client.watermarks().get(runtime, 0), epoch, self.client.connection_generation()
 
-    def _capture_boundary(self, runtime: str) -> tuple[int | None, int | None]:
+    def _capture_boundary(self, runtime: str, profile: str = DEFAULT_PROFILE) -> tuple[int | None, int | None]:
         """Capture the redacted pre-submit durable boundary for reconciliation.
 
         Reads ``session.history`` (durable rows) and stores only the highest
@@ -168,7 +174,7 @@ class LiveService:
         boundary is unknown and reconciliation must stay conservative.
         """
         try:
-            reply = self.client.request("session.history", {"session_id": runtime})
+            reply = self.client.request("session.history", {"session_id": runtime, "profile": profile})
         except LiveError:
             return None, None
         messages = reply.get("messages") if isinstance(reply, dict) else None
@@ -190,24 +196,60 @@ class LiveService:
             return None
         return _validate_text(str(value), field, max_length=max_length)
 
-    def _remember_runtime(self, lane: str, runtime: str, stored: str) -> None:
+    def _remember_runtime(self, profile: str, lane: str, runtime: str, stored: str) -> None:
         with self._lock:
-            self._runtimes[lane] = runtime
+            self._runtimes[(profile, lane)] = runtime
             self._stored_by_runtime[runtime] = stored
         # Runtime ids belong to one TUI gateway process. A reconnect or backend
         # restart may mint a new runtime id for the same durable lane; update
-        # only the redacted identity records, never a stored prompt.
-        for request in self.registry.live_requests_for_lane(lane):
+        # only the redacted identity records, never a stored prompt. The scan
+        # is scoped to this lane's own profile.
+        for request in self.registry.live_requests_for_profile_lane(profile, lane):
             if request.get("runtime_session_id") != runtime:
                 self.registry.update_live_request(request["request_id"], runtime_session_id=runtime)
+        # Reconnect replay must address this session under the same profile.
+        self.client.set_session_profile(runtime, profile)
 
-    def _runtime_for_lane(self, lane: str, supplied: str | None = None, *, reopen: bool = False) -> tuple[str | None, dict[str, Any] | None]:
+    def _lane_profile(self, lane: str, profile: str | None) -> tuple[str, dict[str, Any] | None]:
+        """Resolve a lane's governing profile with fail-closed ambiguity.
+
+        A supplied profile wins. When omitted, a lane bound in exactly one
+        profile infers it, a lane bound in multiple profiles fails with
+        ``lane_profile_ambiguous``, and an unbound lane uses the default
+        profile for creation/start.
+        """
+        if profile is not None:
+            return _profile_input(profile), None
+        bound = self.registry.profiles_for_lane(lane)
+        if len(bound) > 1:
+            return DEFAULT_PROFILE, self._result(
+                status="failed", error_code="lane_profile_ambiguous",
+                error=(f"Lane {lane!r} is bound under multiple profiles {bound}; "
+                       "supply an explicit profile"),
+            )
+        return (bound[0] if bound else DEFAULT_PROFILE), None
+
+    def _runtime_for_lane(
+        self, profile: str, lane: str, supplied: str | None = None, *, reopen: bool = False
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        if supplied:
+            # Lane+runtime addressing must not bypass the runtime's stored
+            # profile binding: a supplied runtime known under other profiles is
+            # a conflict, never a reroute (and emits no gateway frame).
+            bound = self._profiles_for_runtime(supplied)
+            if bound and profile not in bound:
+                return None, self._result(
+                    status="failed", error_code="request_profile_conflict",
+                    error=(f"This live session belongs to profile(s) {bound}; "
+                           f"refusing to route it through profile {profile!r}"),
+                )
+            return supplied, None
         with self._lock:
-            runtime = supplied or self._runtimes.get(lane)
+            runtime = self._runtimes.get((profile, lane))
         if runtime:
             return runtime, None
-        if reopen and self.registry.session_for_lane(lane):
-            opened = self.open(lane=lane)
+        if reopen and self.registry.session_for_profile_lane(profile, lane):
+            opened = self.open(lane=lane, profile=profile)
             if opened.get("ok"):
                 return str(opened["session_id"]), None
             return None, opened
@@ -215,24 +257,27 @@ class LiveService:
 
     _TRANSIENT_RESUME_4007 = "session no longer live; retry resume"
 
-    def _resume_stored(self, target: str) -> Any:
+    def _resume_stored(self, target: str, profile: str = DEFAULT_PROFILE) -> Any:
         # Hermes reattach race (session_lifecycle._reattach_refusal): a resume
         # can lose the race against a reap/retire of the live record it just
         # looked up and receive the transient JSON-RPC 4007 semantic that
         # explicitly instructs the client to retry resume. Exactly ONE
         # immediate retry of the identical resume is allowed: re-attaching
         # repeats the same rebuild operation against the same stored identity
-        # and is not a prompt/steer/interrupt mutation retry. Genuine 4007
+        # and is not a prompt/steer/interrupt mutation retry. The retry reuses
+        # the identical profile-scoped params — dropping profile would resolve
+        # the stored id under the wrong profile home. Genuine 4007
         # "session not found" (an empty draft that never became durable, for
         # example) receives zero retries and stays fail-closed; a second
         # transient failure surfaces through the normal structured error path.
+        params = {"session_id": target, "profile": profile}
         try:
-            return self.client.request("session.resume", {"session_id": target})
+            return self.client.request("session.resume", params)
         except LiveRPCError as exc:
             normalized = " ".join(str(exc).split()).lower()
             if exc.rpc_code != 4007 or normalized != self._TRANSIENT_RESUME_4007:
                 raise
-            return self.client.request("session.resume", {"session_id": target})
+            return self.client.request("session.resume", dict(params))
 
     def open(
         self,
@@ -248,25 +293,37 @@ class LiveService:
     ) -> dict[str, Any]:
         try:
             lane = _validate_text(lane, "lane", max_length=200)
+            profile, profile_error = self._lane_profile(lane, profile)
+            if profile_error is not None:
+                return profile_error
             supplied = _visible_id(session_id, "session_id") if session_id else None
-            current = self.registry.session_for_lane(lane)
+            current = self.registry.session_for_profile_lane(profile, lane)
             if supplied and current and supplied != current:
                 return self._result(
                     status="failed", error_code="lane_session_conflict",
                     error="The lane is already bound to a different durable session_id",
                 )
+            if supplied:
+                bound_profiles = self.registry.profiles_for_session(supplied)
+                if bound_profiles and profile not in bound_profiles:
+                    return self._result(
+                        status="failed", error_code="lane_profile_conflict",
+                        error=(f"The supplied session belongs to profile lane(s) {bound_profiles}; "
+                               f"refusing to bind it under profile {profile!r}"),
+                    )
             connected = self._ensure_connected()
             if connected is not None:
                 return connected
             target = supplied or current
             if target:
-                reply = self._resume_stored(target)
+                reply = self._resume_stored(target, profile)
             else:
                 params: dict[str, Any] = {
                     "source": "tool", "close_on_disconnect": bool(close_on_disconnect),
+                    "profile": profile,
                 }
                 for key, value in (
-                    ("title", title), ("cwd", cwd), ("profile", profile),
+                    ("title", title), ("cwd", cwd),
                     ("model", model), ("provider", provider),
                 ):
                     if value not in (None, ""):
@@ -278,7 +335,9 @@ class LiveService:
             stored = reply.get("stored_session_id") or reply.get("resumed") or target
             if not isinstance(runtime, str) or not runtime or not isinstance(stored, str) or not stored:
                 return self._result(status="failed", error_code="invalid_response", error="Hermes live session response omitted session identity")
-            activated = self.client.request("session.activate", {"session_id": runtime, "omit_messages": True})
+            activated = self.client.request(
+                "session.activate", {"session_id": runtime, "omit_messages": True, "profile": profile}
+            )
             if not isinstance(activated, dict) or activated.get("session_id") != runtime:
                 return self._result(
                     status="failed", error_code="invalid_response",
@@ -288,10 +347,11 @@ class LiveService:
             if not isinstance(activated_stored, str) or not activated_stored:
                 return self._result(status="failed", error_code="invalid_response", error="Hermes live session activation omitted stored identity")
             stored = activated_stored
-            self.registry.bind_lane(lane, stored)
-            self._remember_runtime(lane, runtime, stored)
+            self.registry.bind_profile_lane(profile, lane, stored)
+            self._remember_runtime(profile, lane, runtime, stored)
             result = self._result(
                 status="connected", session_id=runtime, stored_session_id=stored,
+                profile=profile,
                 messages=reply.get("messages") if isinstance(reply.get("messages"), list) else [],
                 message_count=reply.get("message_count"), info=reply.get("info") or {},
                 replay=self.client.health().get("last_replay") or {},
@@ -311,6 +371,7 @@ class LiveService:
         request_id: str | None = None,
         queued: bool = False,
         wait_seconds: float = 0.0,
+        profile: str | None = None,
     ) -> dict[str, Any]:
         try:
             lane = _validate_text(lane, "lane", max_length=200)
@@ -318,14 +379,17 @@ class LiveService:
             if not text.strip():
                 raise InputError("text must not be blank")
             wait = max(0.0, min(float(wait_seconds), 3600.0))
-            runtime, error = self._runtime_for_lane(lane, session_id)
+            profile, profile_error = self._lane_profile(lane, profile)
+            if profile_error is not None:
+                return profile_error
+            runtime, error = self._runtime_for_lane(profile, lane, session_id)
             if error is not None:
                 return error
             request_id = _visible_id(request_id, "request_id", max_length=128) if request_id else f"live_req_{uuid.uuid4().hex}"
-            durable_session = self.registry.session_for_lane(lane) or self._stored_by_runtime.get(runtime or "") or runtime
+            durable_session = self.registry.session_for_profile_lane(profile, lane) or self._stored_by_runtime.get(runtime or "") or runtime
             fingerprint = _fingerprint(lane, {
                 "session_id": durable_session, "text": text, "queued": bool(queued),
-            })
+            }, profile)
             prompt_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
             # The gateway strips the running turn's user text into the inflight
             # snapshot; hash the stripped form so the claim proof compares equal.
@@ -334,10 +398,10 @@ class LiveService:
             return self._input_error(exc, request_id=request_id)
 
         start_seq = self.client.watermarks().get(runtime or "", 0)
-        boundary_row_id, boundary_count = self._capture_boundary(runtime or "")
+        boundary_row_id, boundary_count = self._capture_boundary(runtime or "", profile)
         reserved = self.registry.reserve_live_request({
-            "request_id": request_id, "lane": lane,
-            "session_id": self.registry.session_for_lane(lane) or runtime or "",
+            "request_id": request_id, "lane": lane, "profile": profile,
+            "session_id": self.registry.session_for_profile_lane(profile, lane) or runtime or "",
             "prompt_sha256": prompt_sha, "fingerprint": fingerprint, "status": "pending",
             "runtime_session_id": runtime, "start_seq": start_seq, "error_code": None,
             "inflight_sha256": inflight_sha,
@@ -354,7 +418,10 @@ class LiveService:
                     status="failed", request_id=request_id, session_id=runtime,
                     error_code="request_id_conflict", error="request_id reservation state is unavailable",
                 )
-            if record.get("fingerprint") != fingerprint or record.get("lane") != lane:
+            if (
+                record.get("fingerprint") != fingerprint or record.get("lane") != lane
+                or str(record.get("profile") or DEFAULT_PROFILE) != profile
+            ):
                 return self._result(
                     status="failed", request_id=request_id, session_id=runtime,
                     error_code="request_id_conflict", error="request_id was already used with a different live prompt",
@@ -362,14 +429,14 @@ class LiveService:
             return self._result(
                 status=str(record.get("status") or "unknown"), request_id=request_id,
                 session_id=record.get("runtime_session_id") or runtime,
-                stored_session_id=record.get("session_id"),
+                stored_session_id=record.get("session_id"), profile=profile,
                 error_code=record.get("error_code") or ("transport_unknown" if record.get("status") == "unknown" else None),
                 error="Reconcile this request with live_reconcile; it was not submitted again" if record.get("status") == "unknown" else None,
                 replayed=True, event_cursor=record.get("start_seq"),
                 attribution=record.get("attribution"),
             )
         try:
-            params: dict[str, Any] = {"session_id": runtime, "text": text}
+            params: dict[str, Any] = {"session_id": runtime, "text": text, "profile": profile}
             if queued:
                 params["queued"] = True
             reply = self.client.request("prompt.submit", params)
@@ -384,7 +451,7 @@ class LiveService:
             proof_epoch: str | None = None
             proof_generation: int | None = None
             if status == "streaming":
-                proof = self._prove_running_claim(runtime or "", inflight_sha)
+                proof = self._prove_running_claim(runtime or "", inflight_sha, profile)
                 if proof is not None:
                     attribution, proof_seq, proof_epoch, proof_generation = "claimed", proof[0], proof[1], proof[2]
             self.registry.update_live_request(
@@ -394,8 +461,8 @@ class LiveService:
             )
             result = self._result(
                 status=status, request_id=request_id, session_id=runtime,
-                stored_session_id=self.registry.session_for_lane(lane), event_cursor=start_seq,
-                attribution=attribution,
+                stored_session_id=self.registry.session_for_profile_lane(profile, lane), profile=profile,
+                event_cursor=start_seq, attribution=attribution,
             )
             if wait > 0 and status in {"streaming", "queued"}:
                 return self.wait(request_id=request_id, timeout_seconds=wait)
@@ -432,23 +499,57 @@ class LiveService:
 
     def wait(
         self, *, request_id: str | None = None, lane: str | None = None, timeout_seconds: float = 120.0,
+        profile: str | None = None,
     ) -> dict[str, Any]:
         try:
+            if profile is not None:
+                profile = _profile_input(profile)
             if request_id:
                 request_id = _visible_id(request_id, "request_id", max_length=128)
                 record = self.registry.live_request_by_id(request_id)
             elif lane:
                 lane = _validate_text(lane, "lane", max_length=200)
-                record = self.registry.latest_live_request_for_lane(lane)
+                if profile is not None:
+                    profile = _profile_input(profile)
+                    record = self.registry.latest_live_request_for_profile_lane(profile, lane)
+                else:
+                    lane_profiles = self.registry.live_request_profiles_for_lane(lane)
+                    if not lane_profiles:
+                        # No request rows yet: fall back to the lane bindings so
+                        # a shared lane name is ambiguous even before any wait.
+                        lane_profiles = self.registry.profiles_for_lane(lane)
+                    if len(lane_profiles) > 1:
+                        return self._result(
+                            status="failed", error_code="lane_profile_ambiguous",
+                            error=(f"Lane {lane!r} has live state under multiple profiles {lane_profiles}; "
+                                   "supply an explicit profile"),
+                        )
+                    record = self.registry.latest_live_request_for_profile_lane(
+                        lane_profiles[0] if lane_profiles else DEFAULT_PROFILE, lane
+                    )
                 request_id = str(record.get("request_id")) if record else None
             else:
                 raise InputError("request_id or lane is required")
             if record is None:
-                return self._result(status="failed", request_id=request_id, error_code="request_not_found", error="No live prompt matches the request")
+                return self._result(
+                    status="failed", request_id=request_id, profile=profile or DEFAULT_PROFILE,
+                    error_code="request_not_found", error="No live prompt matches the request",
+                )
+            # The stored request record owns the profile: a supplied different
+            # profile is a conflict, never a reroute of the wait target.
+            record_profile = str(record.get("profile") or DEFAULT_PROFILE)
+            if profile is not None and profile != record_profile:
+                return self._result(
+                    status="failed", request_id=request_id, error_code="request_profile_conflict",
+                    error=(f"This live request belongs to profile {record_profile!r}; "
+                           f"refusing to wait through profile {profile!r}"),
+                )
+            profile = record_profile
             if record.get("status") == "unknown":
                 return self._result(
                     status="unknown", request_id=request_id,
                     session_id=record.get("runtime_session_id"), stored_session_id=record.get("session_id"),
+                    profile=profile,
                     error_code="transport_unknown", error="Reconcile this request before attempting any retry",
                     replayed=True,
                 )
@@ -465,7 +566,7 @@ class LiveService:
             # could only attribute a later — possibly foreign — completion.
             return self._result(
                 status=record_status, request_id=request_id, session_id=runtime,
-                stored_session_id=stored, replayed=True,
+                stored_session_id=stored, profile=profile, replayed=True,
                 error_code=record.get("error_code"),
                 attribution=record.get("attribution"),
             )
@@ -480,6 +581,7 @@ class LiveService:
             return self._result(
                 status="unknown",
                 request_id=request_id, session_id=runtime, stored_session_id=stored,
+                profile=profile,
                 error_code="ambiguous_turn", replayed=True,
                 error=("Ownership of the next gateway completion cannot be proven for this request; "
                        "use live_reconcile for durable evidence. Nothing was attributed or resubmitted."),
@@ -502,13 +604,14 @@ class LiveService:
             # only safe way to keep waiting is a fresh inflight proof of the
             # still-running turn; otherwise the completion is authoritative-
             # recovery territory (live_reconcile/live_history).
-            snapshot = self._running_turn_snapshot(runtime)
+            snapshot = self._running_turn_snapshot(runtime, profile)
             if snapshot is None or not snapshot["running"] or not self._inflight_matches(snapshot, inflight_sha):
                 marked = self._mark_awaiting_recovery(request_id, "completion_not_observed")
                 if marked is not None:
                     return marked
                 return self._result(
                     status="unknown", request_id=request_id, session_id=runtime, stored_session_id=stored,
+                    profile=profile,
                     error_code="completion_not_observed", replayed=True,
                     error=("The claimed turn is no longer running and its completion was not observed on this "
                            "connection; use live_reconcile/live_history for durable recovery."),
@@ -531,6 +634,7 @@ class LiveService:
                 return marked
             return self._result(
                 status="unknown", request_id=request_id, session_id=runtime, stored_session_id=stored,
+                profile=profile,
                 error_code="completion_not_observed", replayed=True,
                 error="Replay for this connection was truncated; use live_reconcile/live_history for durable recovery.",
                 attribution=attribution,
@@ -559,19 +663,21 @@ class LiveService:
                     return marked
                 return self._result(
                     status="unknown", request_id=request_id, session_id=runtime, stored_session_id=stored,
+                    profile=profile,
                     error_code="completion_not_observed", replayed=True,
                     error=("The live connection was re-established during the wait; buffered ordering "
                            "cannot attribute completions. Use live_reconcile/live_history for durable recovery."),
                     attribution=attribution,
                 )
             if event is None:
-                snapshot = self._running_turn_snapshot(runtime)
+                snapshot = self._running_turn_snapshot(runtime, profile)
                 if snapshot is not None and not snapshot["running"] and snapshot.get("inflight_user") is None:
                     marked = self._mark_awaiting_recovery(request_id, "completion_not_observed")
                     if marked is not None:
                         return marked
                     return self._result(
                         status="unknown", request_id=request_id, session_id=runtime, stored_session_id=stored,
+                        profile=profile,
                         error_code="completion_not_observed", replayed=True,
                         error=("The claimed turn is no longer running and its completion was not observed on this "
                                "connection; use live_reconcile/live_history for durable recovery."),
@@ -579,6 +685,7 @@ class LiveService:
                     )
                 return self._result(
                     status="running", request_id=request_id, session_id=runtime, stored_session_id=stored,
+                    profile=profile,
                     error_code="wait_timeout",
                     error="Live prompt is still active; call live_wait or live_events again",
                     attribution=attribution,
@@ -591,14 +698,16 @@ class LiveService:
                     return marked
                 return self._result(
                     status="unknown", request_id=request_id, session_id=runtime, stored_session_id=stored,
+                    profile=profile,
                     error_code="completion_not_observed", replayed=True,
                     error="Live event buffer was evicted before the completion; use live_reconcile/live_history.",
                     attribution=attribution,
                 )
-            snapshot = self._running_turn_snapshot(runtime)
+            snapshot = self._running_turn_snapshot(runtime, profile)
             if snapshot is None:
                 return self._result(
                     status="running", request_id=request_id, session_id=runtime, stored_session_id=stored,
+                    profile=profile,
                     error_code="ambiguous_turn", replayed=True,
                     error="Gateway turn-state evidence is unavailable; completion ownership cannot be proven.",
                     attribution=attribution,
@@ -613,6 +722,7 @@ class LiveService:
                     return marked
                 return self._result(
                     status="unknown", request_id=request_id, session_id=runtime, stored_session_id=stored,
+                    profile=profile,
                     error_code="completion_not_observed", replayed=True,
                     error="Replay for this session was truncated; use live_reconcile/live_history for durable recovery.",
                     attribution=attribution,
@@ -638,7 +748,7 @@ class LiveService:
                                 return marked
                             return self._result(
                                 status="unknown", request_id=request_id, session_id=runtime,
-                                stored_session_id=stored,
+                                stored_session_id=stored, profile=profile,
                                 error_code="completion_not_observed", replayed=True,
                                 error=("The claimed turn failed but the buffered completion is not its terminal "
                                        "event; use live_reconcile/live_history for durable recovery."),
@@ -664,6 +774,7 @@ class LiveService:
                         return marked
                     return self._result(
                         status="unknown", request_id=request_id, session_id=runtime, stored_session_id=stored,
+                        profile=profile,
                         error_code="completion_not_observed", replayed=True,
                         error=("A foreign attached-client turn is live; the local completion was not observed. "
                                "Use live_reconcile/live_history for durable recovery."),
@@ -688,82 +799,128 @@ class LiveService:
             self.registry.update_live_request(request_id, status=status, error_code=error_code)
             return self._result(
                 status=status, request_id=request_id, session_id=runtime,
-                stored_session_id=stored, answer=answer,
+                stored_session_id=stored, profile=profile, answer=answer,
                 error_code=error_code, error=str(payload.get("error")) if payload.get("error") else None,
                 event=event, event_seq=event.get("seq"), attribution=attribution,
             )
 
-    def events(self, *, lane: str | None = None, session_id: str | None = None, after_seq: int = 0) -> dict[str, Any]:
+    def _resolve_live_target(
+        self, *, lane: str | None, session_id: str | None, profile: str | None, reopen: bool = False
+    ) -> tuple[str | None, str, dict[str, Any] | None]:
+        """Resolve (runtime, profile, error) for a live read/control call.
+
+        Lane-addressed calls infer the lane's profile with fail-closed
+        ambiguity; runtime-addressed calls resolve the profile against the
+        stored binding for that runtime — omitted infers it (fail-closed when
+        ambiguous) and a supplied different profile is a conflict, never a
+        reroute. An unknown runtime routes through the supplied profile or the
+        default profile (backward compatibility).
+        """
         try:
-            lane = _validate_text(lane, "lane", max_length=200) if lane else ""
-            runtime, error = self._runtime_for_lane(lane, session_id, reopen=bool(lane))
-            if error is not None:
-                return error
-            after = max(0, int(after_seq))
+            if lane:
+                lane = _validate_text(lane, "lane", max_length=200)
+                resolved_profile, error = self._lane_profile(lane, profile)
+                if error is not None:
+                    return None, DEFAULT_PROFILE, error
+                runtime, error = self._runtime_for_lane(resolved_profile, lane, session_id, reopen=reopen)
+                return runtime, resolved_profile, error
+            if session_id:
+                runtime = _visible_id(session_id, "session_id")
+                bound = self._profiles_for_runtime(runtime)
+                if profile is not None:
+                    canonical = _profile_input(profile)
+                    if bound and canonical not in bound:
+                        return None, DEFAULT_PROFILE, self._result(
+                            status="failed", error_code="request_profile_conflict",
+                            error=(f"This live session belongs to profile(s) {bound}; "
+                                   f"refusing to route it through profile {canonical!r}"),
+                        )
+                    return runtime, canonical, None
+                if len(bound) > 1:
+                    return None, DEFAULT_PROFILE, self._result(
+                        status="failed", error_code="lane_profile_ambiguous",
+                        error=(f"This live session is bound under multiple profiles {bound}; "
+                               "supply an explicit profile"),
+                    )
+                return runtime, (bound[0] if bound else DEFAULT_PROFILE), None
+            raise InputError("lane or session_id is required")
         except (InputError, TypeError, ValueError) as exc:
+            return None, DEFAULT_PROFILE, self._input_error(exc)
+
+    def _profiles_for_runtime(self, runtime: str) -> list[str]:
+        """Locally bound profiles for one runtime id (bindings + request rows)."""
+        stored = self._stored_by_runtime.get(runtime)
+        profiles: set[str] = set(self.registry.live_request_profiles_for_runtime(runtime))
+        if stored:
+            profiles.update(self.registry.profiles_for_session(stored))
+        return sorted(profiles)
+
+    def events(self, *, lane: str | None = None, session_id: str | None = None, after_seq: int = 0,
+               profile: str | None = None) -> dict[str, Any]:
+        try:
+            after = max(0, int(after_seq))
+        except (TypeError, ValueError) as exc:
             return self._input_error(exc)
+        runtime, profile, error = self._resolve_live_target(lane=lane, session_id=session_id, profile=profile, reopen=bool(lane))
+        if error is not None:
+            return error
         events = self.client.events(runtime or "", after_seq=after)
         return self._result(
-            status="connected", session_id=runtime,
+            status="connected", session_id=runtime, profile=profile,
             events=events, event_count=len(events), after_seq=after,
             latest_seq=self.client.watermarks().get(runtime or "", 0),
             truncated=self.client.events_truncated(runtime or "", after_seq=after),
             replay_epoch=self.client.health().get("replay_epoch"),
         )
 
-    def status(self, *, lane: str | None = None, session_id: str | None = None) -> dict[str, Any]:
+    def status(self, *, lane: str | None = None, session_id: str | None = None,
+               profile: str | None = None) -> dict[str, Any]:
+        runtime, profile, error = self._resolve_live_target(lane=lane, session_id=session_id, profile=profile, reopen=bool(lane))
+        if error is not None:
+            return error
         try:
-            lane = _validate_text(lane, "lane", max_length=200) if lane else ""
-            runtime, error = self._runtime_for_lane(lane, session_id, reopen=bool(lane))
-            if error is not None:
-                return error
-            reply = self.client.request("session.status", {"session_id": runtime})
-            return self._result(status="connected", session_id=runtime, stored_session_id=self._stored_by_runtime.get(runtime or ""), gateway_result=reply)
-        except (InputError, TypeError, ValueError) as exc:
-            return self._input_error(exc)
+            reply = self.client.request("session.status", {"session_id": runtime, "profile": profile})
+            return self._result(status="connected", session_id=runtime, profile=profile, stored_session_id=self._stored_by_runtime.get(runtime or ""), gateway_result=reply)
         except LiveError as exc:
             return self._error(exc, session_id=session_id)
 
-    def history(self, *, lane: str | None = None, session_id: str | None = None) -> dict[str, Any]:
+    def history(self, *, lane: str | None = None, session_id: str | None = None,
+                profile: str | None = None) -> dict[str, Any]:
+        runtime, profile, error = self._resolve_live_target(lane=lane, session_id=session_id, profile=profile, reopen=bool(lane))
+        if error is not None:
+            return error
         try:
-            lane = _validate_text(lane, "lane", max_length=200) if lane else ""
-            runtime, error = self._runtime_for_lane(lane, session_id, reopen=bool(lane))
-            if error is not None:
-                return error
-            reply = self.client.request("session.history", {"session_id": runtime})
+            reply = self.client.request("session.history", {"session_id": runtime, "profile": profile})
             messages = reply.get("messages", []) if isinstance(reply, dict) else []
-            return self._result(status="connected", session_id=runtime, stored_session_id=self._stored_by_runtime.get(runtime or ""), messages=messages, message_count=len(messages), gateway_result=reply)
-        except (InputError, TypeError, ValueError) as exc:
-            return self._input_error(exc)
+            return self._result(status="connected", session_id=runtime, profile=profile, stored_session_id=self._stored_by_runtime.get(runtime or ""), messages=messages, message_count=len(messages), gateway_result=reply)
         except LiveError as exc:
             return self._error(exc, session_id=session_id)
 
-    def steer(self, *, text: str, lane: str | None = None, session_id: str | None = None) -> dict[str, Any]:
+    def steer(self, *, text: str, lane: str | None = None, session_id: str | None = None,
+              profile: str | None = None) -> dict[str, Any]:
         try:
             text = _validate_text(text, "text", max_length=100_000, allow_common_whitespace=True)
             if not text.strip():
                 raise InputError("text must not be blank")
-            lane = _validate_text(lane, "lane", max_length=200) if lane else ""
-            runtime, error = self._runtime_for_lane(lane, session_id)
-            if error is not None:
-                return error
-            reply = self.client.request("session.steer", {"session_id": runtime, "text": text})
-            return self._result(status=str(reply.get("status") or "queued") if isinstance(reply, dict) else "queued", session_id=runtime, gateway_result=reply)
         except (InputError, TypeError, ValueError) as exc:
             return self._input_error(exc)
+        runtime, profile, error = self._resolve_live_target(lane=lane, session_id=session_id, profile=profile)
+        if error is not None:
+            return error
+        try:
+            reply = self.client.request("session.steer", {"session_id": runtime, "text": text, "profile": profile})
+            return self._result(status=str(reply.get("status") or "queued") if isinstance(reply, dict) else "queued", session_id=runtime, profile=profile, gateway_result=reply)
         except LiveError as exc:
             return self._error(exc, session_id=session_id)
 
-    def interrupt(self, *, lane: str | None = None, session_id: str | None = None) -> dict[str, Any]:
+    def interrupt(self, *, lane: str | None = None, session_id: str | None = None,
+                  profile: str | None = None) -> dict[str, Any]:
+        runtime, profile, error = self._resolve_live_target(lane=lane, session_id=session_id, profile=profile)
+        if error is not None:
+            return error
         try:
-            lane = _validate_text(lane, "lane", max_length=200) if lane else ""
-            runtime, error = self._runtime_for_lane(lane, session_id)
-            if error is not None:
-                return error
-            reply = self.client.request("session.interrupt", {"session_id": runtime})
-            return self._result(status="interrupted", session_id=runtime, gateway_result=reply)
-        except (InputError, TypeError, ValueError) as exc:
-            return self._input_error(exc)
+            reply = self.client.request("session.interrupt", {"session_id": runtime, "profile": profile})
+            return self._result(status="interrupted", session_id=runtime, profile=profile, gateway_result=reply)
         except LiveError as exc:
             return self._error(exc, session_id=session_id)
 
@@ -780,11 +937,14 @@ class LiveService:
                     error_code=record.get("error_code"),
                 )
             lane = str(record.get("lane") or "")
-            opened = self.open(lane=lane)
+            record_profile = str(record.get("profile") or DEFAULT_PROFILE)
+            # Request identity owns the scope: reconcile always resumes and
+            # reads durable history under the request's own stored profile.
+            opened = self.open(lane=lane, profile=record_profile)
             if not opened.get("ok"):
                 return opened
             runtime = str(opened["session_id"])
-            history = self.history(session_id=runtime)
+            history = self.history(session_id=runtime, profile=record_profile)
             if not history.get("ok"):
                 return history
             messages = history.get("messages") if isinstance(history.get("messages"), list) else []
@@ -794,7 +954,8 @@ class LiveService:
                 # history proves nothing about THIS submit. Stay conservative.
                 return self._result(
                     status="unknown", request_id=request_id, session_id=runtime,
-                    stored_session_id=record.get("session_id"), error_code="reconcile_boundary_missing",
+                    stored_session_id=record.get("session_id"), profile=record_profile,
+                    error_code="reconcile_boundary_missing",
                     error=("This request has no pre-submit durable boundary, so history text equality cannot prove "
                            "the ambiguous submit was persisted. Verify manually; nothing was resubmitted."),
                     reconciliation="legacy_record_without_boundary",
@@ -822,7 +983,8 @@ class LiveService:
                 self.registry.update_live_request(request_id, error_code="ambiguous_history_match")
                 return self._result(
                     status="unknown", request_id=request_id, session_id=runtime,
-                    stored_session_id=record.get("session_id"), error_code="ambiguous_history_match",
+                    stored_session_id=record.get("session_id"), profile=record_profile,
+                    error_code="ambiguous_history_match",
                     error=("Identical post-boundary prompts are indistinguishable in durable history; the ambiguous "
                            "submit was not proven and was not resubmitted."),
                     reconciliation="post_boundary_ambiguous",
@@ -831,13 +993,15 @@ class LiveService:
                 self.registry.update_live_request(request_id, status="reconciled", runtime_session_id=runtime, error_code=None)
                 return self._result(
                     status="reconciled", request_id=request_id, session_id=runtime,
-                    stored_session_id=record.get("session_id"), reconciliation="history_match_post_boundary",
+                    stored_session_id=record.get("session_id"), profile=record_profile,
+                    reconciliation="history_match_post_boundary",
                     warning=("Exactly one post-boundary durable user row matches this prompt; identical older "
                              "prompts were excluded by the pre-submit boundary."),
                 )
             return self._result(
                 status="unknown", request_id=request_id, session_id=runtime,
-                stored_session_id=record.get("session_id"), error_code="transport_unknown",
+                stored_session_id=record.get("session_id"), profile=record_profile,
+                error_code="transport_unknown",
                 error="No post-boundary durable evidence was found; the prompt was not submitted again.",
                 reconciliation="not_observed",
             )
@@ -851,13 +1015,16 @@ class LiveService:
             replay = self.client.reconnect()
             resumed: dict[str, Any] = {}
             with self._lock:
-                lanes = list(self._runtimes)
-            for lane in lanes:
-                stored = self.registry.session_for_lane(lane)
+                bindings = list(self._runtimes)
+            for profile, lane in bindings:
+                # A reconnect may rotate runtime ids but must not rotate
+                # profile identity: every remembered (profile, lane) reopens
+                # under its stored profile binding.
+                stored = self.registry.session_for_profile_lane(profile, lane)
                 if not stored:
                     continue
-                opened = self.open(lane=lane, session_id=stored)
-                resumed[lane] = {
+                opened = self.open(lane=lane, profile=profile, session_id=stored)
+                resumed[f"{profile}:{lane}"] = {
                     "ok": opened.get("ok"), "session_id": opened.get("session_id"),
                     "stored_session_id": opened.get("stored_session_id"), "error_code": opened.get("error_code"),
                 }
