@@ -576,6 +576,35 @@ class LiveProfileTests(unittest.TestCase):
         self.assertTrue(inferred["ok"])
         self.assertEqual(inferred["profile"], "coder")
 
+    def test_lane_plus_runtime_conflicting_profile_fails_closed(self):
+        # The lane branch must not bypass the runtime's stored profile binding:
+        # lane+runtime addressing with a conflicting profile is a conflict, not
+        # a reroute, and never emits a gateway frame or reserves a prompt.
+        service, _, gateway = self.make_service()
+        opened = service.open(lane="repo", profile="coder")
+        self.assertTrue(opened["ok"])
+        runtime = opened["session_id"]
+        frames_before = len(self.all_frames(gateway))
+
+        calls = (
+            lambda: service.status(lane="repo", session_id=runtime, profile="default"),
+            lambda: service.history(lane="repo", session_id=runtime, profile="default"),
+            lambda: service.events(lane="repo", session_id=runtime, profile="default"),
+            lambda: service.steer(text="nudge", lane="repo", session_id=runtime, profile="default"),
+            lambda: service.interrupt(lane="repo", session_id=runtime, profile="default"),
+            lambda: service.prompt(lane="repo", text="must not submit", session_id=runtime, profile="default"),
+        )
+        for call in calls:
+            result = call()
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["error_code"], "request_profile_conflict")
+        self.assertEqual(len(self.all_frames(gateway)), frames_before)
+
+        # Lane+runtime with the omitted profile still infers the lane binding.
+        inferred = service.status(lane="repo", session_id=runtime)
+        self.assertTrue(inferred["ok"])
+        self.assertEqual(inferred["profile"], "coder")
+
     def test_reconnect_replay_carries_the_stored_profile(self):
         service, _, gateway = self.make_service()
         self.assertTrue(service.open(lane="repo", profile="coder")["ok"])
