@@ -17,6 +17,7 @@ from .config import (
     ConfigError,
     default_state_db,
 )
+from .doctor import doctor_json, format_doctor_report, run_doctor
 from .mcp_server import create_server
 from .registry import StateRegistry
 from .service import BridgeService
@@ -26,7 +27,11 @@ logger = logging.getLogger("hermes_zcode_bridge")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="MCP stdio bridge for Hermes Agent durable runs and live TUI")
+    parser = argparse.ArgumentParser(description="MCP control plane for Hermes Agent durable runs and live TUI")
+    parser.add_argument(
+        "command", nargs="?", default="serve", choices=("serve", "doctor"),
+        help="serve MCP over stdio (default) or run non-consuming readiness checks",
+    )
     parser.add_argument("--api-url", default=DEFAULT_API_URL, help="Hermes API Server base URL (non-secret)")
     parser.add_argument("--api-key-env", default=DEFAULT_API_KEY_ENV, help="Environment variable containing API key")
     parser.add_argument("--env-file", type=Path, help="Optional server-side dotenv file to read keys/tokens from")
@@ -70,6 +75,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gateway-event-buffer-max", type=int, default=512)
     parser.add_argument("--gateway-event-buffer-bytes", type=int, default=4 * 1024 * 1024)
     parser.add_argument("--gateway-event-buffer-total-bytes", type=int, default=64 * 1024 * 1024)
+    parser.add_argument(
+        "--profile", action="append", default=[],
+        help="doctor only: named Hermes profile to probe; repeat for multiple profiles",
+    )
+    parser.add_argument(
+        "--all-profiles", action="store_true",
+        help="doctor only: probe every syntactically valid named profile directory",
+    )
+    parser.add_argument(
+        "--require-live", action="store_true",
+        help="doctor only: make unavailable live owner/native attach a hard failure",
+    )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="doctor only: emit one JSON readiness object instead of human-readable text",
+    )
     parser.add_argument("--log-level", default="WARNING", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     return parser
 
@@ -104,6 +125,16 @@ def main(argv: list[str] | None = None) -> int:
             gateway_event_buffer_bytes=args.gateway_event_buffer_bytes,
             gateway_event_buffer_total_bytes=args.gateway_event_buffer_total_bytes,
         )
+        if args.command == "doctor":
+            report = run_doctor(
+                config,
+                profiles=args.profile,
+                all_profiles=bool(args.all_profiles),
+                require_live=bool(args.require_live),
+            )
+            print(doctor_json(report) if args.json else format_doctor_report(report))
+            return 0 if report.get("ok") else 2
+
         registry = StateRegistry(config.state_db)
         client = HermesAPIClient(config)
         service = BridgeService(client, registry)
