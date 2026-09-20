@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-control-mcp"
-version = "0.2.0b1"
+version = "0.2.0b2"
 description = "MCP control plane for Hermes Agent durable runs and optional shared live sessions"
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11,<3.15"
 license = {file = "LICENSE"}
 keywords = ["hermes-agent", "mcp", "model-context-protocol", "agents", "automation"]
 classifiers = [
@@ -19,6 +19,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Software Development",
 ]
 dependencies = [
