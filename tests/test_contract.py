@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import asyncio
 import sqlite3
 import tempfile
@@ -9,7 +10,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from hermes_control_mcp.api import APIError, APIResponse, HermesAPIClient
-from hermes_control_mcp.config import BridgeConfig, ConfigError
+from hermes_control_mcp.config import BridgeConfig, ConfigError, default_state_db
 from hermes_control_mcp.registry import REGISTRY_SCHEMA_VERSION, RegistryError, StateRegistry
 from hermes_control_mcp.service import BridgeService
 
@@ -103,6 +104,37 @@ class BridgeContractTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RegistryError, "newer than supported"):
                 StateRegistry(path)
+
+    def test_default_state_path_prefers_new_public_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("XDG_STATE_HOME")
+            os.environ["XDG_STATE_HOME"] = tmp
+            self.addCleanup(
+                lambda: os.environ.__setitem__("XDG_STATE_HOME", old)
+                if old is not None
+                else os.environ.pop("XDG_STATE_HOME", None)
+            )
+            expected = Path(tmp) / "hermes-control-mcp" / "bridge.db"
+            self.assertEqual(default_state_db(), expected)
+
+    def test_default_state_path_reuses_legacy_db_when_new_db_is_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("XDG_STATE_HOME")
+            os.environ["XDG_STATE_HOME"] = tmp
+            self.addCleanup(
+                lambda: os.environ.__setitem__("XDG_STATE_HOME", old)
+                if old is not None
+                else os.environ.pop("XDG_STATE_HOME", None)
+            )
+            legacy = Path(tmp) / "hermes-zcode-bridge" / "bridge.db"
+            legacy.parent.mkdir(parents=True)
+            legacy.touch()
+            self.assertEqual(default_state_db(), legacy)
+
+            preferred = Path(tmp) / "hermes-control-mcp" / "bridge.db"
+            preferred.parent.mkdir(parents=True)
+            preferred.touch()
+            self.assertEqual(default_state_db(), preferred)
 
     def test_start_sends_explicit_session_and_structured_result(self):
         def handler(method, url, headers, body, timeout):
