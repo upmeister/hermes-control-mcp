@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-control-mcp"
-version = "0.2.0b2"
+version = "0.2.0b3"
 description = "MCP control plane for Hermes Agent durable runs and optional shared live sessions"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"

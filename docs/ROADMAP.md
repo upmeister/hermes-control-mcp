@@ -54,6 +54,49 @@ Before broadening the protocol surface, keep a small maintenance lane open for p
 
 This lane runs in parallel with the research items below and does not block low-risk analysis work.
 
+## First queued implementation: UX1 — setup and client-config onboarding
+
+Before broader protocol work, remove avoidable onboarding friction from the
+current stdio release.
+
+Target user journey:
+
+~~~text
+install -> doctor -> generate client config -> connect
+~~~
+
+The first UX patch should add a non-mutating setup/config generator, for example:
+
+~~~text
+hermes-control-mcp client-config zcode
+hermes-control-mcp client-config cursor
+hermes-control-mcp client-config codex
+hermes-control-mcp client-config vscode
+hermes-control-mcp client-config <client> --ssh <hermes-host>
+~~~
+
+Exact command naming can be finalized during implementation, but the contract
+should be:
+
+- detect/report the same-host happy path without requiring users to understand
+  `--api-url`, `--env-file`, or `--profiles-root`;
+- emit the exact host-specific config shape for major MCP clients rather than
+  calling one JSON schema generic;
+- generate the current SSH-launch form for remote stdio clients without copying
+  Hermes profile secrets to the client machine;
+- choose or suggest a safe per-client state DB path;
+- reuse `doctor` readiness/config discovery instead of duplicating it;
+- print proposed configuration by default; do not silently mutate third-party
+  client config files;
+- keep credentials out of generated command arguments and tracked files.
+
+Documentation and implementation should be designed together so the generated
+output remains the canonical source for examples rather than hand-maintained
+snippets drifting across clients.
+
+This is deliberately a small UX layer over the existing trust model, not a new
+remote transport.
+
 ## Next substantive priority: R1 — Agent Sessions API parity research
 
 Compare Hermes:
@@ -101,6 +144,11 @@ Do not let one unattended model silently authorize privileged requests for anoth
 Why this comes before remote HTTP MCP: it closes a real capability gap in controlling Hermes safely, while preserving the existing local stdio trust model.
 
 ## Later: P2 — Streamable HTTP MCP
+
+This is the intended long-term remote UX after UX1: keep the bridge beside
+Hermes so profile credentials remain local, and expose the MCP control surface
+through an authenticated remote transport instead of asking users to mirror
+Hermes secret trees onto another machine.
 
 Useful for remote MCP clients, but it creates a new trust boundary:
 

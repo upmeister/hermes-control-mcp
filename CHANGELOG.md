@@ -4,6 +4,10 @@ All notable public changes to Hermes MCP Control Plane are documented here.
 
 ## [Unreleased]
 
+## [0.2.0b3] - 2026-09-21
+
+Onboarding and diagnostics patch.
+
 ### Added
 
 - User-first onboarding documentation for same-host, remote API, and SSH

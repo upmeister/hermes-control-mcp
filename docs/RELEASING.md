@@ -7,8 +7,8 @@ This document defines the public release process.
 - Package: `hermes-control-mcp`
 - Primary CLI: `hermes-control-mcp`
 - Python package: `hermes_control_mcp`
-- Current beta line: `0.2.0b2`
-- Tag format: `v<version>` (for example `v0.2.0b2`)
+- Current beta line: `0.2.0b3`
+- Tag format: `v<version>` (for example `v0.2.0b3`)
 
 ## One-time PyPI setup
 
@@ -28,13 +28,19 @@ The release workflow grants `id-token: write` only to the PyPI publish job.
 
 ## Prepare a release
 
+**Important:** creating a Git tag does not bump the package version. The version
+must already be committed on `main` before the tag is created.
+
 1. Confirm `main` is the exact release candidate and CI is green.
 2. Confirm production/deployment smoke is complete when the change affects runtime behavior.
-3. Confirm these versions match:
-   - `pyproject.toml`
-   - `src/hermes_control_mcp/__init__.py`
-   - the release heading in `CHANGELOG.md`
-4. Keep a fresh `[Unreleased]` section above the versioned changelog entry.
+3. Prepare and merge a release-version commit/PR **before tagging**:
+   - set the target version in `pyproject.toml`;
+   - set the same version in `src/hermes_control_mcp/__init__.py`;
+   - move the relevant notes from `[Unreleased]` into a matching
+     `## [<version>] - YYYY-MM-DD` section in `CHANGELOG.md`;
+   - leave a fresh empty `[Unreleased]` section above it.
+4. Re-read those three files from `main` and confirm they all name the exact
+   version you are about to tag.
 5. Verify no private hostnames, credentials, local vault paths, or deployment secrets are tracked.
 6. Verify:
 
@@ -53,8 +59,8 @@ Create and push the exact version tag from `main`:
 ~~~bash
 git switch main
 git pull --ff-only
-git tag -a v0.2.0b2 -m "Hermes MCP Control Plane 0.2.0b2"
-git push origin v0.2.0b2
+git tag -a v0.2.0b3 -m "Hermes MCP Control Plane 0.2.0b2"
+git push origin v0.2.0b3
 ~~~
 
 `release.yml` then:
@@ -76,7 +82,7 @@ After the workflow succeeds:
 ~~~bash
 python -m venv /tmp/hermes-control-release-check
 /tmp/hermes-control-release-check/bin/python -m pip install --upgrade pip
-/tmp/hermes-control-release-check/bin/pip install hermes-control-mcp==0.2.0b2
+/tmp/hermes-control-release-check/bin/pip install hermes-control-mcp==0.2.0b3
 /tmp/hermes-control-release-check/bin/hermes-control-mcp --help
 /tmp/hermes-control-release-check/bin/hermes-control-mcp doctor
 ~~~
@@ -97,7 +103,7 @@ rerun the PyPI publish step and do not rebuild the package.
 Use the manual `release` workflow recovery mode:
 
 1. open **Actions → release → Run workflow** on `main`;
-2. set `release_tag` to the already-published tag, for example `v0.2.0b2`;
+2. set `release_tag` to the already-published tag, for example `v0.2.0b3`;
 3. set `source_run_id` to the original release workflow run that produced the
    verified `release-dist` artifact;
 4. run the workflow.
@@ -110,9 +116,9 @@ the GitHub Release.
 
 Do not reuse a version with different contents after any distribution file has reached PyPI.
 
-- If build/smoke fails before publish: fix the branch, merge, and create a new tag only after the release candidate is correct.
+- If validation/build/smoke fails before publish: fix the branch, merge, delete the failed unpublished tag if necessary, and create the tag again only after the release candidate is correct.
 - If PyPI rejects Trusted Publishing: correct the PyPI/GitHub publisher configuration; do not add an emergency long-lived token unless the release process is deliberately redesigned.
-- If a file for the version was already accepted by PyPI and code must change, bump to a new version (for example `0.2.0b2`).
+- If a file for the version was already accepted by PyPI and code must change, bump to a new version (for example `0.2.0b4`).
 - If GitHub Release creation fails after PyPI succeeds, recreate the GitHub Release from the exact workflow distributions; do not rebuild the package.
 
 ## Release security
