@@ -232,8 +232,20 @@ class LiveService:
     def _runtime_for_lane(
         self, profile: str, lane: str, supplied: str | None = None, *, reopen: bool = False
     ) -> tuple[str | None, dict[str, Any] | None]:
+        if supplied:
+            # Lane+runtime addressing must not bypass the runtime's stored
+            # profile binding: a supplied runtime known under other profiles is
+            # a conflict, never a reroute (and emits no gateway frame).
+            bound = self._profiles_for_runtime(supplied)
+            if bound and profile not in bound:
+                return None, self._result(
+                    status="failed", error_code="request_profile_conflict",
+                    error=(f"This live session belongs to profile(s) {bound}; "
+                           f"refusing to route it through profile {profile!r}"),
+                )
+            return supplied, None
         with self._lock:
-            runtime = supplied or self._runtimes.get((profile, lane))
+            runtime = self._runtimes.get((profile, lane))
         if runtime:
             return runtime, None
         if reopen and self.registry.session_for_profile_lane(profile, lane):
