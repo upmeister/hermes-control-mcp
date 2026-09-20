@@ -127,14 +127,20 @@ def _run_client_config(args: argparse.Namespace) -> int:
     warnings: list[str] = []
     discovery = None
     try:
-        name = client_config.validate_server_name(args.name or DEFAULT_SERVER_NAME)
+        # An explicit empty --name is user input, not an omission: it must be
+        # rejected instead of silently rewritten into the default identity.
+        raw_name = args.name if args.name is not None else DEFAULT_SERVER_NAME
+        name = client_config.validate_server_name(raw_name)
         if args.ssh is not None:
             discovery = client_config.discover_ssh(args.ssh)
             plan = client_config.build_ssh_plan(args.client, name, discovery)
         else:
             plan = client_config.build_local_plan(args.client, name, warn=warnings.append)
         payload = client_config.render_plan(plan, args.client)
-    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+    except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        # RuntimeError covers expanduser failures from a malformed XDG/HOME
+        # value; the client-config contract requires exit 2 with a concise
+        # stderr diagnostic instead of a traceback.
         print(f"client-config: {exc}", file=sys.stderr)
         return 2
 

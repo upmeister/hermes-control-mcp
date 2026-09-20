@@ -136,12 +136,15 @@ hermes-control-mcp client-config codex --ssh hermes-host
 See the **[MCP client configuration matrix](docs/MCP-CLIENTS.md)** for exact
 same-host and SSH examples for ZCode, Claude Code, Cursor, Codex, and VS Code.
 
-Existing ZCode examples:
+Repository examples (generated fixtures are byte-checked against the
+`client-config` renderers by tests):
 
-- [local/common `mcpServers` stdio shape](examples/mcp-stdio.json)
-- [ZCode → remote Hermes API](examples/zcode-remote-api.json)
-- [ZCode → SSH-launched bridge on Hermes host](examples/zcode-ssh.json)
-- [ZCode → SSH + experimental live owner attach](examples/zcode-ssh-live.json)
+- [generated `mcpServers` fixture (Claude Code shape)](examples/mcp-stdio.json)
+- [ZCode → remote Hermes API](examples/zcode-remote-api.json) — hand-written
+  direct-API example, not generator output
+- [generated ZCode → SSH fixture](examples/zcode-ssh.json)
+- [ZCode → SSH + experimental live owner attach](examples/zcode-ssh-live.json) —
+  hand-written example, not generator output
 - [generated per-client fixtures](examples/client-config/)
 
 ## MCP surface

@@ -39,9 +39,21 @@ Properties shared by every generated configuration:
 - no Hermes routing flags (`--api-url`, `--env-file`, `--profiles-root`) and no
   credential values are emitted; keys stay in the bridge process environment.
 
-The JSON/TOML examples in the rest of this document are exactly the shapes the
-command emits. Checked fixtures generated from the same renderers live under
-[`examples/client-config/`](../examples/client-config/).
+The JSON/TOML payload examples in this document are the **exact output** of the
+`client-config` renderers for an installation at
+`/home/user/.local/bin/hermes-control-mcp`; the checked fixtures under
+[`examples/client-config/`](../examples/client-config/) are byte-compared
+against the same renderers in tests. Any hand-written minimal variant is
+called out explicitly and is not generator output.
+
+Repository example files:
+
+- `examples/client-config/<client>.{json,toml}` — generated same-host fixtures;
+- `examples/mcp-stdio.json` — generated fixture in the common `mcpServers`
+  (Claude Code) shape;
+- `examples/zcode-ssh.json` — generated `--ssh` fixture (native ZCode shape);
+- `examples/zcode-ssh-live.json` — hand-written example for the experimental
+  SSH + live owner-attach pattern; not generator output.
 
 ## Client matrix
 
@@ -77,19 +89,24 @@ A ready durable core means the client entry can be minimal.
 The easiest route is **Settings -> MCP Servers -> New MCP Server**:
 
 - type: `stdio`
-- command: `hermes-control-mcp`
-- no arguments required for the default same-host setup.
+- command: `hermes-control-mcp` (the generator emits the discovered absolute path)
+- no arguments are strictly required for a single-host, single-client setup;
+  the generated config additionally embeds an explicit per-client state DB,
+  which is recommended whenever more than one MCP host may run.
 
 ZCode's native user configuration is stored under
-`~/.zcode/cli/config.json`:
+`~/.zcode/cli/config.json`. Generated payload (`client-config zcode`):
 
 ~~~json
 {
   "mcp": {
     "servers": {
       "hermes": {
-        "command": "hermes-control-mcp",
-        "args": []
+        "command": "/home/user/.local/bin/hermes-control-mcp",
+        "args": [
+          "--state-db",
+          "/home/user/.local/state/hermes-control-mcp/clients/zcode-hermes.db"
+        ]
       }
     }
   }
@@ -97,18 +114,7 @@ ZCode's native user configuration is stored under
 ~~~
 
 ZCode also accepts the `mcpServers` form in Full configuration mode and in
-`~/.agents/mcp.json`:
-
-~~~json
-{
-  "mcpServers": {
-    "hermes": {
-      "type": "stdio",
-      "command": "hermes-control-mcp"
-    }
-  }
-}
-~~~
+`~/.agents/mcp.json`; use the Claude Code payload below for those surfaces.
 
 ### Claude Code
 
@@ -116,14 +122,17 @@ ZCode also accepts the `mcpServers` form in Full configuration mode and in
 claude mcp add --scope user hermes -- hermes-control-mcp
 ~~~
 
-For a project-scoped file:
+For a project-scoped file, the generated payload (`client-config claude-code`):
 
 ~~~json
 {
   "mcpServers": {
     "hermes": {
-      "command": "hermes-control-mcp",
-      "args": []
+      "command": "/home/user/.local/bin/hermes-control-mcp",
+      "args": [
+        "--state-db",
+        "/home/user/.local/state/hermes-control-mcp/clients/claude-code-hermes.db"
+      ]
     }
   }
 }
@@ -131,15 +140,19 @@ For a project-scoped file:
 
 ### Cursor
 
-`~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project):
+`~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project), generated
+payload (`client-config cursor`):
 
 ~~~json
 {
   "mcpServers": {
     "hermes": {
       "type": "stdio",
-      "command": "hermes-control-mcp",
-      "args": []
+      "command": "/home/user/.local/bin/hermes-control-mcp",
+      "args": [
+        "--state-db",
+        "/home/user/.local/state/hermes-control-mcp/clients/cursor-hermes.db"
+      ]
     }
   }
 }
@@ -147,28 +160,32 @@ For a project-scoped file:
 
 ### OpenAI Codex
 
-`~/.codex/config.toml`:
+`~/.codex/config.toml`, generated payload (`client-config codex`):
 
 ~~~toml
 [mcp_servers.hermes]
-command = "hermes-control-mcp"
-args = []
+command = "/home/user/.local/bin/hermes-control-mcp"
+args = ["--state-db", "/home/user/.local/state/hermes-control-mcp/clients/codex-hermes.db"]
 ~~~
 
 The Codex desktop/IDE settings UI can add the same server by choosing
-**STDIO** and entering `hermes-control-mcp` as the command.
+**STDIO** and entering the bridge command as shown above.
 
 ### VS Code / Copilot
 
-`.vscode/mcp.json` or the user MCP configuration:
+`.vscode/mcp.json` or the user MCP configuration, generated payload
+(`client-config vscode`):
 
 ~~~json
 {
   "servers": {
     "hermes": {
       "type": "stdio",
-      "command": "hermes-control-mcp",
-      "args": []
+      "command": "/home/user/.local/bin/hermes-control-mcp",
+      "args": [
+        "--state-db",
+        "/home/user/.local/state/hermes-control-mcp/clients/vscode-hermes.db"
+      ]
     }
   }
 }
@@ -201,46 +218,48 @@ setups. First make sure the remote executable path is stable:
 ssh hermes-host 'command -v hermes-control-mcp'
 ~~~
 
-Then use that absolute path in the client command.
+Then use that absolute path in the client command — or let the generator do
+all of it, including the per-client state DB name.
 
-### `mcpServers`-family clients
+### Claude Code, Cursor, and ZCode compatibility surfaces
 
-This shape works for Cursor, Claude Code project configuration, and ZCode
-Full configuration / `.agents/mcp.json`:
+Generated payload of `client-config claude-code --ssh hermes-host` (Cursor
+adds `"type": "stdio"`, ZCode Full configuration / `.agents/mcp.json` accept
+the same shape; each client's own DB name comes from running the command for
+that client):
 
 ~~~json
 {
   "mcpServers": {
     "hermes": {
-      "type": "stdio",
       "command": "ssh",
       "args": [
         "-T",
         "hermes-host",
-        "/home/user/.local/bin/hermes-control-mcp",
-        "--state-db",
-        "/home/user/.local/state/hermes-control-mcp/client.db"
+        "/home/user/.local/bin/hermes-control-mcp --state-db /home/user/.local/state/hermes-control-mcp/clients/claude-code-hermes.db"
       ]
     }
   }
 }
 ~~~
 
+Note that the remote bridge command and its `--state-db` argument travel as
+**one ssh argv element**; the remote shell parses it, so discovered paths with
+spaces stay safe.
+
 ### Codex
+
+Generated payload of `client-config codex --ssh hermes-host`:
 
 ~~~toml
 [mcp_servers.hermes]
 command = "ssh"
-args = [
-  "-T",
-  "hermes-host",
-  "/home/user/.local/bin/hermes-control-mcp",
-  "--state-db",
-  "/home/user/.local/state/hermes-control-mcp/codex.db",
-]
+args = ["-T", "hermes-host", "/home/user/.local/bin/hermes-control-mcp --state-db /home/user/.local/state/hermes-control-mcp/clients/codex-hermes.db"]
 ~~~
 
 ### VS Code
+
+Generated payload of `client-config vscode --ssh hermes-host`:
 
 ~~~json
 {
@@ -251,9 +270,7 @@ args = [
       "args": [
         "-T",
         "hermes-host",
-        "/home/user/.local/bin/hermes-control-mcp",
-        "--state-db",
-        "/home/user/.local/state/hermes-control-mcp/vscode.db"
+        "/home/user/.local/bin/hermes-control-mcp --state-db /home/user/.local/state/hermes-control-mcp/clients/vscode-hermes.db"
       ]
     }
   }

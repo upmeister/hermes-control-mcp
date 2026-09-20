@@ -31,10 +31,18 @@ def default_profiles_root() -> Path:
 def state_home() -> Path:
     """XDG state base directory used for bridge-owned registry files."""
     configured = os.environ.get("XDG_STATE_HOME")
-    base = Path(configured).expanduser() if configured else Path.home() / ".local" / "state"
-    if not base.is_absolute():
-        # Client-config generation embeds absolute paths; a relative
-        # XDG_STATE_HOME would leak the generator's cwd into those configs, so
+    base: Path | None = None
+    if configured:
+        try:
+            base = Path(configured).expanduser()
+        except RuntimeError:
+            # A malformed ~user reference is treated as unset, mirroring the
+            # relative-path fallback below, so every command resolves the same
+            # state home instead of crashing on an ambient value.
+            base = None
+    if base is None or not base.is_absolute():
+        # Client-config generation embeds absolute paths; a relative or
+        # invalid XDG_STATE_HOME would leak the generator's cwd or crash, so
         # fall back to the XDG default instead.
         base = Path.home() / ".local" / "state"
     return base

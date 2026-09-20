@@ -9,6 +9,7 @@ payload; human guidance and warnings belong on stderr.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import shutil
@@ -130,7 +131,11 @@ def discover_local_bridge_command(
     lookup = which if which is not None else shutil.which
     found = lookup(BRIDGE_COMMAND)
     if found:
-        return found
+        # which() can return a cwd-relative path (for example PATH="." ->
+        # "./hermes-control-mcp"). Generated configs must not depend on a GUI
+        # host's working directory, so normalize to absolute without chasing
+        # symlinks (resolving them could embed venv internals).
+        return os.path.abspath(found)
     if warn is not None:
         warn(
             f"{BRIDGE_COMMAND} was not found on PATH; emitting the bare command name. "

@@ -131,6 +131,38 @@ class ClientConfigCliCompatTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 2)
         self.assertIn("only valid with the client-config command", err.getvalue())
 
+    def test_cli_explicit_empty_name_is_rejected_not_rewritten_to_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"HOME": tmp, "XDG_STATE_HOME": str(Path(tmp) / "state"), "PATH": "/usr/bin:/bin"}
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(cc.shutil, "which", return_value=ABSOLUTE_BRIDGE):
+                for argv in (["client-config", "zcode", "--name", ""], ["client-config", "zcode", "--name="]):
+                    with self.subTest(argv=argv):
+                        code, out, err = run_main(argv)
+                        self.assertEqual(code, 2)
+                        self.assertEqual(out, "")
+                        self.assertIn("Invalid MCP server name", err)
+
+    def test_malformed_xdg_state_home_falls_back_gracefully(self):
+        # A malformed ~user XDG value is treated as unset: generation must not
+        # traceback (exit 1) and must stay consistent with where the bridge
+        # itself would resolve its state home under the same environment.
+        env = {
+            "HOME": "/home/ubuntu",
+            "XDG_STATE_HOME": "~definitely-no-such-user-ux1/state",
+            "PATH": "/usr/bin:/bin",
+        }
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(cc.shutil, "which", return_value=ABSOLUTE_BRIDGE):
+            code, out, err = run_main(["client-config", "zcode"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("Traceback", err)
+        payload = json.loads(out)
+        db = payload["mcp"]["servers"]["hermes"]["args"][1]
+        self.assertEqual(
+            db, "/home/ubuntu/.local/state/hermes-control-mcp/clients/zcode-hermes.db"
+        )
+
 
 class ClientConfigLocalPlanTests(unittest.TestCase):
     def test_local_discovery_prefers_absolute_installed_command(self):
@@ -145,6 +177,28 @@ class ClientConfigLocalPlanTests(unittest.TestCase):
             which=lambda _name: ABSOLUTE_BRIDGE,
         )
         self.assertEqual(plan.command, "/custom/path/bridge")
+
+    def test_relative_which_result_is_normalized_to_absolute(self):
+        # Adversarial control for the real shutil.which: a cwd-relative PATH
+        # element makes which() return "./hermes-control-mcp", which must not
+        # reach the generated config as a GUI-host command.
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp) / cc.BRIDGE_COMMAND
+            exe.write_text("#!/bin/sh\nexit 0\n")
+            exe.chmod(0o755)
+            previous_cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                env = dict(os.environ)
+                env["PATH"] = "."
+                warnings: list[str] = []
+                with mock.patch.dict(os.environ, env, clear=True):
+                    plan = cc.build_local_plan("zcode", "hermes", warn=warnings.append)
+            finally:
+                os.chdir(previous_cwd)
+            self.assertTrue(Path(plan.command).is_absolute())
+            self.assertEqual(Path(plan.command), Path(tmp) / cc.BRIDGE_COMMAND)
+            self.assertEqual(warnings, [])
 
     def test_fallback_command_warns_but_still_generates(self):
         warnings: list[str] = []
@@ -427,6 +481,25 @@ class ClientConfigSecretBoundaryTests(unittest.TestCase):
             for client in cc.SUPPORTED_CLIENTS:
                 plan = cc.build_ssh_plan(client, "hermes", discovery)
                 self.assertNotIn(CANARY, cc.render_plan(plan, client))
+
+    def test_cli_ssh_full_path_is_secret_free_on_stdout_and_stderr(self):
+        home = self.prepare_secretful_home()
+        state = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(state, ignore_errors=True))
+        env = dict(os.environ)
+        env.update(CANARY_ENV)
+        env["HOME"] = home
+        env["XDG_STATE_HOME"] = state
+        original = cc.discover_ssh
+        runner = FakeSSHRunner(stdout="/opt/bridge\n/home/u\n")
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(cc, "discover_ssh", lambda host, **_kw: original(host, runner=runner)):
+            code, out, err = run_main(["client-config", "zcode", "--ssh", "hermes-host"])
+        self.assertEqual(code, 0)
+        self.assertNotIn(CANARY, out)
+        self.assertNotIn(CANARY, err)
+        self.assertNotIn("API_SERVER_KEY", out)
+        self.assertIn("--state-db", out)
 
 
 class ClientConfigSideEffectTests(unittest.TestCase):
