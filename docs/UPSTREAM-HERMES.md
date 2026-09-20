@@ -1,8 +1,12 @@
 # Hermes upstream research snapshot
 
 Research date: **2026-09-20**.
-Fresh current-main SHA checked for the Stage 2.2B handoff:
-`8a92051f20e6b371c4ff1a46a5bcec7138cc4e8c`.
+Fresh current-main SHA rechecked after the first public bridge release:
+`59f9ff8dbc75b9c4f07ae10174df730f7882a505`.
+
+The earlier Stage 2.2B handoff was checked against
+`8a92051f20e6b371c4ff1a46a5bcec7138cc4e8c`; the relevant profile/session
+contracts below remain unchanged in the post-release recheck.
 
 This document records facts relevant to hermes-control-mcp. It deliberately
 separates stable release behavior, current-main observations and open proposals.
@@ -147,7 +151,7 @@ every distinguishable case but cannot invent missing server identity.
 
 ## Open PR #106742 — unified gateway authority
 
-Status at research time: **open, not merged**.
+Status at the post-release recheck: **open, not merged**.
 
 Title/theme: one gateway owns every local session.
 
@@ -172,7 +176,7 @@ Bridge strategy:
 
 ## Open issue #109891 — gateway as Desktop backend
 
-Status at research time: **open**.
+Status at the post-release recheck: **open**.
 
 The proposal argues for a first-class gateway backend for Desktop and explicitly
 separates:
