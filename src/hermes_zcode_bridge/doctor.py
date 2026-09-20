@@ -29,9 +29,27 @@ def discover_named_profiles(profiles_root: Path) -> list[str]:
     return sorted(set(names))
 
 
-def _safe_error(exc: Exception) -> tuple[str, str]:
+def _redact_config_secrets(config: BridgeConfig, text: str) -> str:
+    values = (
+        config.resolved_api_key(),
+        config.resolved_gateway_token(),
+        config.resolved_gateway_access_token(),
+        config.resolved_gateway_refresh_token(),
+        config.resolved_gateway_ticket(),
+    )
+    redacted = str(text)
+    for value in values:
+        if value:
+            redacted = redacted.replace(value, "[REDACTED]")
+    return redacted
+
+
+def _safe_error(exc: Exception, *, config: BridgeConfig | None = None) -> tuple[str, str]:
     code = str(getattr(exc, "code", "") or "doctor_check_failed")
-    return code, str(exc)
+    message = str(exc)
+    if config is not None:
+        message = _redact_config_secrets(config, message)
+    return code, message
 
 
 def _api_probe(client: HermesAPIClient, profile: str) -> dict[str, Any]:
@@ -40,7 +58,7 @@ def _api_probe(client: HermesAPIClient, profile: str) -> dict[str, Any]:
         capabilities = client.capabilities(profile=profile)
         models = client.models(profile=profile)
     except (APIError, ConfigError, ValueError) as exc:
-        code, message = _safe_error(exc)
+        code, message = _safe_error(exc, config=client.config)
         return {
             "ok": False,
             "status": "failed",
@@ -93,7 +111,7 @@ def _live_probe(
             "replay_epoch": health.get("replay_epoch"),
         }
     except LiveError as exc:
-        code, message = _safe_error(exc)
+        code, message = _safe_error(exc, config=config)
         return {
             "ok": False,
             "required": False,
@@ -137,7 +155,7 @@ def run_doctor(
         api_client = api_client_factory(config)
         core = _api_probe(api_client, DEFAULT_PROFILE)
     except (ConfigError, APIError, ValueError) as exc:
-        code, message = _safe_error(exc)
+        code, message = _safe_error(exc, config=config)
         core = {
             "ok": False,
             "status": "failed",
