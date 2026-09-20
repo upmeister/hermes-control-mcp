@@ -66,24 +66,50 @@ python -m pip install -e .
 
 ## Quick start
 
-Hermes API Server must already be running. The default target is `http://127.0.0.1:8642`.
+Hermes MCP Control Plane does **not** start or configure Hermes for you. Before
+the bridge can connect, Hermes must have its API Server enabled and the bridge
+must know both the API URL and the matching `API_SERVER_KEY`.
 
-Keep API keys in environment/server-side configuration, not MCP arguments.
+Choose your topology first:
+
+| Bridge location | What to configure | Live owner attach |
+|---|---|---|
+| Same host as Hermes | usually defaults + local Hermes `.env` are enough | possible with compatible owner seam |
+| Another VM/host | `--api-url` + bridge-side key/env file; Hermes must be reachable over LAN/VPN/tunnel | not through the owner lease |
+| Launched on Hermes host through SSH | remote MCP client uses SSH; bridge still uses local Hermes config/secrets | recommended remote shape for experimental live attach |
+
+For the default same-host case:
 
 ~~~bash
-export API_SERVER_KEY='...'
+hermes config set API_SERVER_ENABLED true
+hermes config set API_SERVER_KEY '<strong-secret>'
+hermes gateway restart
+
 hermes-control-mcp doctor
 ~~~
 
-A healthy durable-only deployment may report the live tier as unavailable and still return `READY`.
+A healthy durable-only deployment may report the live tier as unavailable and
+still return `READY`.
 
-To make live attach mandatory:
+If Hermes is on another machine, **do not expect the zero-argument doctor to
+discover it**: the default API target is `http://127.0.0.1:8642`. Use
+`--api-url` and make the key available to the bridge, for example:
 
 ~~~bash
-hermes-control-mcp doctor --require-live
+hermes-control-mcp doctor \
+  --api-url http://192.168.1.50:8642 \
+  --env-file ~/.config/hermes-control-mcp/hermes.env
 ~~~
 
+For named profiles, SSH deployments, LAN exposure, state DB ownership,
+`API_SERVER_KEY` creation/resolution, platform limits, and doctor
+troubleshooting, read the **[Getting started and connection topologies](docs/GETTING-STARTED.md)** guide.
+
 ### MCP host configuration
+
+The smallest configuration below is valid only when the bridge runs in an
+environment where its defaults are correct (normally the same host/user as
+Hermes):
 
 ~~~json
 {
@@ -95,7 +121,15 @@ hermes-control-mcp doctor --require-live
 }
 ~~~
 
-A generic example is available at [`examples/mcp-stdio.json`](examples/mcp-stdio.json).
+MCP client syntax varies. Some hosts require `"type": "stdio"`; that field is
+client configuration, not a bridge option.
+
+Examples:
+
+- [generic local stdio](examples/mcp-stdio.json)
+- [ZCode → remote Hermes API](examples/zcode-remote-api.json)
+- [ZCode → SSH-launched bridge on Hermes host](examples/zcode-ssh.json)
+- [ZCode → SSH + experimental live owner attach](examples/zcode-ssh-live.json)
 
 ## MCP surface
 
@@ -188,6 +222,7 @@ CI tests Python 3.11, 3.12, 3.13, and 3.14. It also builds wheel + sdist and per
 
 ## Documentation
 
+- [Getting started and connection topologies](docs/GETTING-STARTED.md)
 - [Compatibility and support tiers](docs/COMPATIBILITY.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Hermes upstream research](docs/UPSTREAM-HERMES.md)
