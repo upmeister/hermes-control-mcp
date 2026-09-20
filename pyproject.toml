@@ -34,7 +34,6 @@ Documentation = "https://github.com/upmeister/hermes-control-mcp#readme"
 
 [project.scripts]
 hermes-control-mcp = "hermes_control_mcp.server:main"
-hermes-zcode-bridge = "hermes_control_mcp.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

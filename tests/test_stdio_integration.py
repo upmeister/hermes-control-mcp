@@ -48,7 +48,7 @@ class StdioEntrypointTests(unittest.TestCase):
             env["TEST_BRIDGE_KEY"] = "test-api-key"
             process = subprocess.Popen(
                 [
-                    str(Path(__file__).parents[1] / "scripts" / "run-bridge.sh"),
+                    str(Path(__file__).parents[1] / "scripts" / "run-control-mcp.sh"),
                     "--api-url",
                     f"http://127.0.0.1:{api.server_port}",
                     "--api-key-env",

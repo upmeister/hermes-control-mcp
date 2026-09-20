@@ -1,6 +1,8 @@
+> Historical implementation contract. Stage 2.2C completed the public-beta hardening pass and is retained for auditability. Current release instructions live in [RELEASING.md](RELEASING.md).
+
 # Stage 2.2C implementation brief — public-beta hardening
 
-Status: **IN PROGRESS**
+Status: **COMPLETE / HISTORICAL**
 
 Behavioral base:
 
@@ -47,9 +49,7 @@ Confirmed public distribution/repository/primary CLI slug:
 Python import package:
 `hermes_control_mcp`.
 
-The historical `hermes-zcode-bridge` console script may remain as a temporary
-compatibility alias for existing private deployments during the beta rename,
-but it is not the public brand.
+The pre-public compatibility alias was removed before the first public beta. The only public console script is `hermes-control-mcp`.
 
 ## Required work
 

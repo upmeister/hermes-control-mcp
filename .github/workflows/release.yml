@@ -1,0 +1,148 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build and verify release artifacts
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Validate tag and package version
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          root = pathlib.Path('.')
+          project = tomllib.loads((root / 'pyproject.toml').read_text(encoding='utf-8'))
+          version = project['project']['version']
+          namespace = {}
+          exec((root / 'src/hermes_control_mcp/__init__.py').read_text(encoding='utf-8'), namespace)
+          module_version = namespace['__version__']
+          tag = os.environ['GITHUB_REF_NAME']
+
+          if module_version != version:
+              raise SystemExit(f'package version mismatch: pyproject={version} module={module_version}')
+          if tag != f'v{version}':
+              raise SystemExit(f'tag/version mismatch: tag={tag} package={version}')
+          print(f'release version: {version}')
+          PY
+
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+          python -m build
+          python -m twine check dist/*
+
+      - name: Install exact wheel in a fresh venv
+        run: |
+          python -m venv /tmp/hermes-control-release
+          /tmp/hermes-control-release/bin/python -m pip install --upgrade pip
+          /tmp/hermes-control-release/bin/python -m pip install dist/*.whl
+          /tmp/hermes-control-release/bin/hermes-control-mcp --help
+
+      - name: Installed doctor and MCP stdio smoke
+        run: |
+          python scripts/installed_smoke.py \
+            --entrypoint /tmp/hermes-control-release/bin/hermes-control-mcp
+
+      - name: Extract release notes from changelog
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+
+          version = os.environ['GITHUB_REF_NAME'].removeprefix('v')
+          lines = pathlib.Path('CHANGELOG.md').read_text(encoding='utf-8').splitlines()
+          start = None
+          end = len(lines)
+          for i, line in enumerate(lines):
+              if line.startswith(f'## [{version}]'):
+                  start = i + 1
+                  continue
+              if start is not None and line.startswith('## '):
+                  end = i
+                  break
+          if start is None:
+              raise SystemExit(f'CHANGELOG.md has no section for {version}')
+          notes = '\n'.join(lines[start:end]).strip()
+          if not notes:
+              raise SystemExit(f'CHANGELOG.md section for {version} is empty')
+          pathlib.Path('release-notes.md').write_text(notes + '\n', encoding='utf-8')
+          PY
+
+      - name: Upload verified release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: |
+            dist/*
+            release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  pypi-publish:
+    name: publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/hermes-control-mcp
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download verified release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    name: create GitHub Release
+    needs: pypi-publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download published release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          extra=()
+          if [[ "$version" =~ (a|b|rc|dev)[0-9]+ ]]; then
+            extra+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "Hermes MCP Control Plane $version" \
+            --notes-file release-notes.md \
+            "${extra[@]}"

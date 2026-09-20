@@ -35,12 +35,13 @@ upstream/API research.
 - Stage 2.2B: complete — first-class multi-profile routing.
 - Stage 2.2B.1: complete — omitted-profile admission inference follows existing
   identity before defaulting.
-- Current milestone: **Stage 2.2C public-beta hardening**, defined in
-  `docs/STAGE-2.2C-IMPLEMENTATION-BRIEF.md`.
+- Stage 2.2C: complete — public-beta packaging, doctor, schema v1, CI and
+  compatibility/release documentation.
+- Current release line: **0.2.x public beta**.
 
-Stage 2.2C may change packaging, CI, diagnostics, docs and registry schema
-version metadata. It must not add HTTP MCP, interactive approvals, new Hermes
-runtime authority or Agent Sessions migration.
+New work should start from one explicit problem/contract rather than reopening
+historical Stage 2 milestones. HTTP MCP, interactive approvals, native transport
+changes and Agent Sessions migration remain separate review boundaries.
 
 ## Source of truth
 
@@ -49,7 +50,8 @@ architecture:
 
 - `README.md` — public-facing architecture/status;
 - `docs/ROADMAP.md` — milestone plan;
-- `docs/STAGE-2.2C-IMPLEMENTATION-BRIEF.md` — current release-hardening contract;
+- `docs/RELEASING.md` — current release process;
+- `docs/STAGE-2.2C-IMPLEMENTATION-BRIEF.md` — historical public-beta hardening contract;
 - `docs/STAGE-2.2B-IMPLEMENTATION-BRIEF.md` — historical multi-profile contract;
 - `docs/STAGE-2.2-IMPLEMENTATION-BRIEF.md` — historical Stage 2.2A contract;
 - `docs/COMPATIBILITY.md` — public support tiers and prerequisites;
@@ -75,8 +77,9 @@ Default API target is `http://127.0.0.1:8642`.
 - Server status/history is recovery authority; event streams are observation,
   not a replacement for reconciliation.
 
-Stage 2.2B will make profile routing first-class. Until then, do not pretend an
-unprefixed API URL dynamically targets named Hermes profiles.
+Profile routing is first-class. Named profiles use Hermes `/p/<profile>/...`
+routes and their own API keys; never collapse a named-profile operation into the
+default profile through ambient process state or credential fallback.
 
 ## Live-plane contract
 
@@ -170,30 +173,18 @@ Do not expose:
 A new capability requires an explicit MCP method with its own validation and
 failure contract.
 
-## Stage 2.2B exact scope
+## Post-beta priorities
 
-The next behavioral PR must follow
-`docs/STAGE-2.2B-IMPLEMENTATION-BRIEF.md`.
+Use [ROADMAP.md](docs/ROADMAP.md) for current priorities.
 
-Core invariant:
+High-level boundaries:
 
-~~~text
-(profile, lane) -> stored_session_id
-~~~
-
-Required high-level outcomes:
-
-1. profile-aware lane/request registry with safe legacy default migration;
-2. named profile preserved through live create, resume, reconnect, prompt,
-   history/status and controls;
-3. durable API routing through `/p/<profile>/...`;
-4. named profiles use their own `API_SERVER_KEY` and never inherit default;
-5. omitted profile may infer only one unambiguous existing lane binding;
-6. the same lane name may coexist in multiple profiles; ambiguous lane-only
-   routing fails closed.
-
-It does **not** migrate Runs to Agent Sessions, add HTTP MCP, approvals,
-cross-platform IPC, package publication or A2A orchestration.
+1. research Agent Sessions API parity before migrating durable Runs behavior;
+2. prefer a supported Hermes native/session-authority seam over growing the
+   private owner adapter;
+3. treat interactive server requests as a separate security design;
+4. treat Streamable HTTP MCP as a new remote trust boundary;
+5. keep broad A2A/peer orchestration out of scope without a concrete use case.
 
 ## Upstream-awareness rules
 
@@ -215,9 +206,9 @@ Primary public distribution is expected to remain a standalone Python package /
 isolated runner because the MCP client owns bridge process lifetime. A Hermes
 plugin may later be a companion installer/discovery/configuration layer.
 
-Stage 2.2C is the explicit release-scoped PR: CI, package metadata, MIT license,
-doctor diagnostics and clean-installed-artifact checks are in scope. Actual
-PyPI publication remains a separate maintainer action.
+Public releases use the tag-driven workflow in `.github/workflows/release.yml`
+and the runbook in `docs/RELEASING.md`. PyPI publication is a maintainer
+boundary protected by the `pypi` GitHub environment and Trusted Publishing.
 
 ## Checks
 
