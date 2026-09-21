@@ -223,6 +223,23 @@ class ClientConfigLocalPlanTests(unittest.TestCase):
             self.assertTrue(state_home().is_absolute())
             self.assertTrue(cc.client_state_db("zcode", "hermes").is_absolute())
 
+    def test_relative_home_and_xdg_still_yield_absolute_state_db(self):
+        # Even with both ambient anchors relative, the passwd-entry fallback
+        # must keep the generated state DB path absolute (UX1 contract).
+        env = {"HOME": "relative-home", "XDG_STATE_HOME": "relative-state"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            plan = cc.build_local_plan("zcode", "hermes", which=lambda _name: ABSOLUTE_BRIDGE)
+            db = cc.client_state_db("zcode", "hermes")
+        self.assertTrue(Path(plan.args[-1]).is_absolute())
+        self.assertTrue(db.is_absolute())
+        self.assertEqual(db.name, "zcode-hermes.db")
+
+    def test_unresolvable_state_home_fails_closed(self):
+        with mock.patch.object(cc, "state_home", return_value=Path("relative/state")):
+            with self.assertRaises(cc.ClientConfigError) as ctx:
+                cc.build_local_plan("zcode", "hermes", which=lambda _name: ABSOLUTE_BRIDGE)
+        self.assertIn("absolute", str(ctx.exception))
+
     def test_generator_does_not_create_the_state_db(self):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.dict(os.environ, {"XDG_STATE_HOME": tmp, "HOME": tmp}):

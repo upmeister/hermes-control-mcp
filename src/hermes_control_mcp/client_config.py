@@ -111,7 +111,16 @@ def client_state_db(client: str, server_name: str, *, remote_home: str | None = 
         base = Path(remote_home) / ".local" / "state" / "hermes-control-mcp"
     else:
         base = state_home() / "hermes-control-mcp"
-    return base / "clients" / f"{client}-{server_name}.db"
+    db = base / "clients" / f"{client}-{server_name}.db"
+    if not db.is_absolute():
+        # Generated configs must embed absolute paths; a relative result means
+        # the local environment has no absolute home to anchor to, so fail
+        # closed instead of emitting a cwd-dependent identity.
+        raise ClientConfigError(
+            "Could not resolve an absolute home directory for the per-client "
+            "state DB; run with an absolute HOME and retry."
+        )
+    return db
 
 
 def discover_local_bridge_command(
