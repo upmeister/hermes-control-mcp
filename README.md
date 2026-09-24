@@ -117,15 +117,35 @@ familiar `{"mcpServers": {...}}` shape is common across several hosts and is
 accepted by ZCode's compatibility/full-config surfaces, but it is not universal:
 Codex uses TOML and VS Code uses a top-level `servers` object.
 
+Instead of hand-writing these snippets, let the bridge generate the right shape:
+
+~~~bash
+hermes-control-mcp client-config zcode        # or: claude-code, cursor, codex, vscode
+~~~
+
+The command is non-mutating: stdout carries only the generated payload
+(guidance goes to stderr), no client, bridge, or Hermes configuration file is
+created or edited, and each config embeds an explicit absolute per-client
+state DB. For an MCP host on another machine, keep the bridge — and all Hermes
+secrets — on the Hermes host:
+
+~~~bash
+hermes-control-mcp client-config codex --ssh hermes-host
+~~~
+
 See the **[MCP client configuration matrix](docs/MCP-CLIENTS.md)** for exact
 same-host and SSH examples for ZCode, Claude Code, Cursor, Codex, and VS Code.
 
-Existing ZCode examples:
+Repository examples (generated fixtures are byte-checked against the
+`client-config` renderers by tests):
 
-- [local/common `mcpServers` stdio shape](examples/mcp-stdio.json)
-- [ZCode → remote Hermes API](examples/zcode-remote-api.json)
-- [ZCode → SSH-launched bridge on Hermes host](examples/zcode-ssh.json)
-- [ZCode → SSH + experimental live owner attach](examples/zcode-ssh-live.json)
+- [generated `mcpServers` fixture (Claude Code shape)](examples/mcp-stdio.json)
+- [ZCode → remote Hermes API](examples/zcode-remote-api.json) — hand-written
+  direct-API example, not generator output
+- [generated ZCode → SSH fixture](examples/zcode-ssh.json)
+- [ZCode → SSH + experimental live owner attach](examples/zcode-ssh-live.json) —
+  hand-written example, not generator output
+- [generated per-client fixtures](examples/client-config/)
 
 ## MCP surface
 

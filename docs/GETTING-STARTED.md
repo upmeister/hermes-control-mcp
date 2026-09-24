@@ -37,7 +37,16 @@ It is intentionally the simplest deployment: the default API URL, default key,
 and named-profile key tree can all be discovered locally.
 
 Client configuration files are a separate concern. MCP defines the wire
-protocol, not one universal host-config schema. See
+protocol, not one universal host-config schema. The bridge can generate the
+right shape for your host without touching any configuration file:
+
+~~~bash
+hermes-control-mcp client-config zcode
+hermes-control-mcp client-config codex --ssh hermes-host
+~~~
+
+`client-config` prints one non-mutating configuration payload on stdout, with
+an explicit absolute per-client state DB, and keeps guidance on stderr. See
 [MCP client configuration](MCP-CLIENTS.md) for ZCode, Claude Code, Cursor,
 Codex, and VS Code examples.
 
@@ -198,7 +207,8 @@ example:
 
 The public-beta ownership contract is one bridge process per state DB. If two
 independent MCP hosts may run bridge processes concurrently, give them separate
-DB files.
+DB files. Generated `client-config` output already does this: every generated
+config embeds its own `<client>-<server-name>.db` path.
 
 ## Choose a topology
 

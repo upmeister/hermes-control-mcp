@@ -1,10 +1,11 @@
 {
-  "mcpServers": {
+  "servers": {
     "hermes": {
+      "type": "stdio",
       "command": "/home/user/.local/bin/hermes-control-mcp",
       "args": [
         "--state-db",
-        "/home/user/.local/state/hermes-control-mcp/clients/claude-code-hermes.db"
+        "/home/user/.local/state/hermes-control-mcp/clients/vscode-hermes.db"
       ]
     }
   }

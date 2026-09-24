@@ -28,10 +28,45 @@ def default_profiles_root() -> Path:
     return hermes_home() / "profiles"
 
 
+def _passwd_home() -> Path | None:
+    """Absolute home directory from the user database, independent of $HOME."""
+    try:
+        import pwd
+    except ImportError:  # non-Unix platforms have no passwd database
+        return None
+    try:
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (KeyError, OSError):
+        return None
+
+
+def state_home() -> Path:
+    """XDG state base directory used for bridge-owned registry files."""
+    configured = os.environ.get("XDG_STATE_HOME")
+    base: Path | None = None
+    if configured:
+        try:
+            base = Path(configured).expanduser()
+        except RuntimeError:
+            # A malformed ~user reference is treated as unset, mirroring the
+            # relative-path fallback below, so every command resolves the same
+            # state home instead of crashing on an ambient value.
+            base = None
+    if base is None or not base.is_absolute():
+        # Client-config generation embeds absolute paths; a relative or
+        # invalid XDG_STATE_HOME would leak the generator's cwd or crash, so
+        # fall back to an absolute home instead. A relative $HOME must not
+        # leak either: prefer the cwd-independent passwd entry when available.
+        home = Path.home()
+        if not home.is_absolute():
+            home = _passwd_home() or home
+        base = home / ".local" / "state"
+    return base
+
+
 def default_state_db() -> Path:
-    state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")).expanduser()
-    preferred = state_home / "hermes-control-mcp" / "bridge.db"
-    legacy = state_home / "hermes-zcode-bridge" / "bridge.db"
+    preferred = state_home() / "hermes-control-mcp" / "bridge.db"
+    legacy = state_home() / "hermes-zcode-bridge" / "bridge.db"
     # Reuse the historical private-deployment path only when the new public
     # path does not exist, avoiding an accidental empty registry after rename.
     if not preferred.exists() and legacy.exists():

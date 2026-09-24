@@ -1,0 +1,13 @@
+{
+  "mcp": {
+    "servers": {
+      "hermes": {
+        "command": "/home/user/.local/bin/hermes-control-mcp",
+        "args": [
+          "--state-db",
+          "/home/user/.local/state/hermes-control-mcp/clients/zcode-hermes.db"
+        ]
+      }
+    }
+  }
+}

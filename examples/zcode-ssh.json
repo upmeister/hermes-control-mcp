@@ -1,17 +1,14 @@
 {
-  "mcpServers": {
-    "hermes": {
-      "type": "stdio",
-      "command": "ssh",
-      "args": [
-        "-T",
-        "hermes-host",
-        "/home/user/.local/bin/hermes-control-mcp",
-        "--state-db",
-        "/home/user/.local/state/hermes-control-mcp/zcode.db",
-        "--log-level",
-        "WARNING"
-      ]
+  "mcp": {
+    "servers": {
+      "hermes": {
+        "command": "ssh",
+        "args": [
+          "-T",
+          "hermes-host",
+          "/home/user/.local/bin/hermes-control-mcp --state-db /home/user/.local/state/hermes-control-mcp/clients/zcode-hermes.db"
+        ]
+      }
     }
   }
 }
