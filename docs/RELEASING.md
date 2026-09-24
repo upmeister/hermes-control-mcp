@@ -7,7 +7,7 @@ This document defines the public release process.
 - Package: `hermes-control-mcp`
 - Primary CLI: `hermes-control-mcp`
 - Python package: `hermes_control_mcp`
-- Current beta line: `0.2.0b3`
+- Current beta line: `0.2.0b4`
 - Tag format: `v<version>` (for example `v0.2.0b3`)
 
 ## One-time PyPI setup
