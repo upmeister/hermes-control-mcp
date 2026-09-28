@@ -4,6 +4,10 @@ All notable public changes to Hermes MCP Control Plane are documented here.
 
 ## [Unreleased]
 
+## [0.2.0b5] - 2026-09-28
+
+Session visibility control and owner-adapter recovery.
+
 ### Added
 
 - `--session-source SOURCE`: operator-selectable source for live MCP sessions.
