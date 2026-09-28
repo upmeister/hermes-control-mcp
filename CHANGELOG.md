@@ -4,6 +4,33 @@ All notable public changes to Hermes MCP Control Plane are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- `--session-source SOURCE`: operator-selectable source for live MCP sessions.
+  The default remains `tool`, which Hermes hides from human-facing session
+  lists, so existing deployments are unchanged. Passing a visible source such
+  as `tui` makes bridge sessions appear in Desktop/TUI session listings.
+  Accepted values are validated against an allowlist (`tool`, `tui`, `cli`,
+  `webui`, `subagent`, `test`, `acp`) and an unknown value is refused at
+  startup: sources outside that set change session ownership semantics
+  upstream, not just visibility, so a future Hermes platform must not become
+  reachable by accident.
+- `scripts/reapply-owner-adapter.sh`: re-applies the out-of-tree Hermes
+  owner-adapter seam after a `hermes update` removes it, using a 3-way apply
+  that reconciles upstream drift. `--check` only reports whether the seam is
+  present and whether the lease points at a live PID. The script never
+  restarts services or writes live state.
+
+### Changed
+
+- Documented how to upgrade an installed copy: `uv tool install` is
+  idempotent and keeps a recorded requirement pin, so moving to a newer
+  release needs `--force` (or `--upgrade` to replace the pin). The same applies
+  to `pipx` and to `pip install` inside an existing virtual environment.
+- Documented the owner-adapter lifecycle: the lease is rewritten when the
+  Hermes owner process starts, so a lease pointing at a dead PID means the seam
+  was removed by an update and the owner process must be restarted.
+
 ## [0.2.0b4] - 2026-09-25
 
 Onboarding UX patch: client-config generation.

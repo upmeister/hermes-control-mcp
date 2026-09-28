@@ -103,7 +103,10 @@ class BridgeService:
         self.registry = registry
         from .live_client import LiveGatewayClient
         from .live_service import LiveService
-        self.live = LiveService(LiveGatewayClient(client.config), registry)
+        self.live = LiveService(
+            LiveGatewayClient(client.config), registry,
+            source=client.config.session_source,
+        )
 
     @staticmethod
     def _result(

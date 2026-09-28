@@ -21,6 +21,7 @@ from .config import (
     DEFAULT_GATEWAY_ACCESS_TOKEN_ENV,
     DEFAULT_GATEWAY_REFRESH_TOKEN_ENV,
     DEFAULT_GATEWAY_TOKEN_ENV,
+    SESSION_SOURCES,
     BridgeConfig,
     ConfigError,
     default_state_db,
@@ -75,6 +76,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Private local owner-adapter lease JSON (uses same-user Unix WebSocket; no dashboard token)",
     )
     parser.add_argument("--gateway-http-url", help="Optional HTTP origin for /api/auth/ws-ticket")
+    parser.add_argument(
+        "--session-source", default=None, metavar="SOURCE",
+        help=(
+            "Session source for live MCP sessions (default: tool, which Hermes hides from "
+            "human-facing session lists). Use 'tui' to make bridge sessions visible in "
+            "Desktop/TUI listings. Allowed: " + ", ".join(sorted(SESSION_SOURCES))
+        ),
+    )
     parser.add_argument(
         "--gateway-token-env", default=DEFAULT_GATEWAY_TOKEN_ENV,
         help="Env name for a reusable loopback dashboard token (no credential value in args)",
@@ -200,6 +209,7 @@ def main(argv: list[str] | None = None) -> int:
             gateway_event_buffer_max=args.gateway_event_buffer_max,
             gateway_event_buffer_bytes=args.gateway_event_buffer_bytes,
             gateway_event_buffer_total_bytes=args.gateway_event_buffer_total_bytes,
+            session_source=args.session_source,
         )
         if args.command == "doctor":
             report = run_doctor(

@@ -363,6 +363,42 @@ on the same Linux host and as the same Unix user as the compatible Hermes owner
 runtime. A bridge running on another VM cannot consume this lease over the
 network.
 
+#### Making bridge sessions visible in Desktop
+
+By default the bridge opens live sessions with `source: tool`, and Hermes hides
+`kanban`, `tool` and `oneshot` sessions from human-facing session lists. Bridge
+sessions are therefore absent from the Desktop/TUI session list by design: the
+UI is not expected to drive a lane that an agent owns.
+
+To make them visible, start the bridge with an explicit source:
+
+~~~json
+{
+  "mcpServers": {
+    "hermes": {
+      "type": "stdio",
+      "command": "/home/user/.local/bin/hermes-control-mcp",
+      "args": [
+        "--gateway-owner-lease",
+        "/home/user/.hermes/runtime/owner_adapter/owner_adapter.json",
+        "--session-source",
+        "tui",
+        "--log-level",
+        "WARNING"
+      ]
+    }
+  }
+}
+~~~
+
+Allowed values are `tool` (default), `tui`, `cli`, `webui`, `subagent`, `test`
+and `acp`. An unknown value is refused at startup instead of being forwarded to
+Hermes, because sources outside that set change session *ownership* semantics
+upstream rather than only visibility: a source that Hermes treats as
+gateway-owned suppresses the automatic end of a session, and `desktop`
+triggers cleanup on disconnect. Visibility is therefore an allowlist, so a
+future Hermes platform cannot become reachable by accident.
+
 ## Platform support
 
 Current release CI runs on Linux.

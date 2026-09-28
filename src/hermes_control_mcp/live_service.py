@@ -6,6 +6,7 @@ import time
 import uuid
 from typing import Any
 
+from .config import validate_session_source
 from .live_client import LiveAuthError, LiveError, LiveGatewayClient, LiveRPCError, LiveTransportUnknown
 from .profiles import DEFAULT_PROFILE
 from .registry import StateRegistry
@@ -15,9 +16,13 @@ from .service import InputError, _fingerprint, _optional_profile, _profile_input
 class LiveService:
     """Safe MCP-facing facade over one persistent TUI WebSocket client."""
 
-    def __init__(self, client: LiveGatewayClient, registry: StateRegistry) -> None:
+    def __init__(self, client: LiveGatewayClient, registry: StateRegistry,
+                 source: str | None = None) -> None:
         self.client = client
         self.registry = registry
+        # Validated once at construction: an operator-selected source reaches
+        # session.create for every live session this process opens.
+        self.session_source = validate_session_source(source)
         self._lock = threading.RLock()
         # runtime ids are process-local and keyed by (profile, lane): the same
         # lane name may legally exist in two profiles, so a lane-only key would
@@ -346,7 +351,8 @@ class LiveService:
                 reply = self._resume_stored(target, profile)
             else:
                 params: dict[str, Any] = {
-                    "source": "tool", "close_on_disconnect": bool(close_on_disconnect),
+                    "source": self.session_source,
+                    "close_on_disconnect": bool(close_on_disconnect),
                     "profile": profile,
                 }
                 for key, value in (
