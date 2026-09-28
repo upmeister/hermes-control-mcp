@@ -40,6 +40,39 @@ For a CLI application, an isolated tool environment is the recommended install:
 uv tool install hermes-control-mcp
 ~~~
 
+### Upgrading an installed copy
+
+`uv tool install` is idempotent: if a requirement pin already exists for the
+tool, re-running it resolves and reports the same versions without upgrading.
+To move an installed copy to a newer release, force the reinstall:
+
+~~~bash
+uv tool install --force hermes-control-mcp
+~~~
+
+To move to a specific version, or to keep the pin and reinstall exactly it:
+
+~~~bash
+uv tool install --force "hermes-control-mcp==0.2.0b4"
+~~~
+
+If the pin must be replaced because a newer version was published, `--upgrade`
+(`-U`) relaxes the recorded pin:
+
+~~~bash
+uv tool install --upgrade hermes-control-mcp
+~~~
+
+After any upgrade, re-run the readiness check:
+
+~~~bash
+hermes-control-mcp doctor
+~~~
+
+The same pinning behaviour applies to `pipx install` and to `pip install` in an
+existing virtual environment, where an already-satisfied requirement is left
+alone unless you pass `--upgrade`.
+
 If you prefer plain `pip`, install inside a virtual environment:
 
 ~~~bash
@@ -210,6 +243,13 @@ Shared live attach is currently **experimental**.
 The deployed implementation joins the existing Hermes TUI gateway through a private local owner boundary. Stock Hermes v0.21.3 does not ship that project-specific owner seam.
 
 Installing this package is therefore sufficient for the durable tier, but not by itself a promise that shared Desktop/TUI attach is available.
+
+The owner seam is an out-of-tree patch, so a `hermes update` removes it. When a
+lease still exists but points at a dead PID, the bridge reports the owner
+process as not live. `scripts/reapply-owner-adapter.sh --check` reports both
+conditions without changing anything; running the script without `--check`
+re-applies the seam. Restarting the Hermes owner process afterwards is a
+separate, deliberate step - the script never restarts services itself.
 
 The project is tracking Hermes upstream native/session-authority work and intends to adapt the live transport when a supported upstream seam lands rather than maintain a permanent competing runtime.
 

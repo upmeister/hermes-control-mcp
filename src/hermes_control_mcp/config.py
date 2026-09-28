@@ -13,6 +13,51 @@ DEFAULT_GATEWAY_TOKEN_ENV = "HERMES_DASHBOARD_SESSION_TOKEN"
 DEFAULT_GATEWAY_ACCESS_TOKEN_ENV = "HERMES_DASHBOARD_ACCESS_TOKEN"
 DEFAULT_GATEWAY_REFRESH_TOKEN_ENV = "HERMES_DASHBOARD_REFRESH_TOKEN"
 
+# Session ``source`` values an operator may select for live MCP sessions.
+# Hermes hides "kanban"/"tool"/"oneshot" from human-facing session.list
+# (INTERNAL_LISTING_SOURCES in tui_gateway/methods_session.py), so "tool" is the
+# default and hides bridge sessions from Desktop.
+#
+# This is an allowlist, not a denylist, because two upstream rules make most
+# values unsafe rather than just invisible (tui_gateway/session_lifecycle.py):
+#   * a source outside _NON_GATEWAY_SOURCES that resolves to a gateway Platform
+#     becomes gateway-owned, which suppresses end_session() and can start the
+#     Groundhog Day self-heal loop;
+#   * "desktop" enables automatic lease/row cleanup on ws_disconnect, which
+#     would silently drop a bridge session on reconnect.
+# A new upstream Platform must never become reachable through this option.
+DEFAULT_SESSION_SOURCE = "tool"
+SESSION_SOURCES = frozenset({
+    "tool", "tui", "cli", "webui", "subagent", "test", "acp",
+})
+MAX_SESSION_SOURCE_CHARS = 200
+
+
+def validate_session_source(value: str | None) -> str:
+    """Return the normalized live-session source, or refuse the configuration.
+
+    ``None``/empty keeps the public-beta default. A caller-supplied source is
+    matched case-insensitively against :data:`SESSION_SOURCES`; an unknown value
+    fails closed instead of being forwarded to Hermes, where it would silently
+    produce a hidden or gateway-owned session.
+    """
+    if value is None:
+        return DEFAULT_SESSION_SOURCE
+    if not isinstance(value, str):
+        raise ConfigError("session source must be a string")
+    normalized = value.strip().lower()
+    if not normalized:
+        raise ConfigError("session source must not be empty")
+    if len(normalized) > MAX_SESSION_SOURCE_CHARS:
+        raise ConfigError(
+            f"session source must be at most {MAX_SESSION_SOURCE_CHARS} characters"
+        )
+    if normalized not in SESSION_SOURCES:
+        raise ConfigError(
+            "session source must be one of: " + ", ".join(sorted(SESSION_SOURCES))
+        )
+    return normalized
+
 
 class ConfigError(ValueError):
     """The bridge cannot start safely with the supplied configuration."""
@@ -181,8 +226,13 @@ class BridgeConfig:
     gateway_event_buffer_bytes: int = 4 * 1024 * 1024
     gateway_event_buffer_total_bytes: int = 64 * 1024 * 1024
     gateway_event_sessions_max: int = 256
+    # Session ``source`` for live MCP sessions. None keeps the validated default
+    # (DEFAULT_SESSION_SOURCE); an explicit value is checked in __post_init__.
+    session_source: str | None = None
 
     def __post_init__(self) -> None:
+        # Fail closed at startup rather than at the first session.create.
+        self.session_source = validate_session_source(self.session_source)
         self.api_url = self.api_url.rstrip("/")
         if not self.api_url:
             raise ConfigError("API URL must not be empty")
